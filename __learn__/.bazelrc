@@ -1,0 +1,4 @@
+# Bazel build & test configuration for Envoy
+# 200Mb RAM is quite sufficient for local builds; see this:
+# https://docs.bazel.build/versions/master/skylark/performance.html#memory-profiling
+  
