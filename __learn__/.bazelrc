@@ -1,0 +1,8 @@
+# Bazel build & test configuration for Envoy
+# 200Mb RAM is quite sufficient for local builds; see this:
+# https://docs.bazel.build/versions/master/skylark/performance.html#memory-profiling
+# For a large host, all the allocated working memory specified by a cgroup could be used up as the default heap memory size in the JVM is a quarter of actual RAM, up to a 32Gb ceiling
+# To make space for the compiler/linker, we put a cap on the heap size (so GC can occur and thus make space)
+# We choose 3Gb to anticipate large VMs and small VMs with RBE
+# Can't select startup options via config
+startup --host_jvm_args=-Xmx3g
