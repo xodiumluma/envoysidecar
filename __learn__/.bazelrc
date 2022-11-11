@@ -28,3 +28,52 @@ build --action_env=PATH --host_action_env=PATH
 
 build --enable_platform_specific_config
 build --test_summary=terse
+
+# influence execution requirements with (experimental) tags
+common --experimental_allow_tags_propagation
+
+# turn on PIC (position independent code) on linux; it's already enabled for macOs and Windows
+# this is a workaround; see https://github.com/bazelbuild/rules_foreign_cc/issues/421
+build:linux --copt=fPIC
+build:linux --copt=-Wno-deprecated-declarations
+build:linux --cxxopt=-std=c++17 --host_cxxopt=-std=c++17
+build:linux --conlyopt=-fexceptions
+build:linux --fission=dbg,opt
+build:linux --features=per_object_debug_info
+build:linux --action_env=BAZEL_LINKLIBS=-l%:libstdc++.a
+build:linux --action_env=BAZEL_LINKOPTS=-1m
+
+# inform googletest to use absl (abseil) for backtrace
+# we can do so as absl is already included
+build --define absl=1
+
+# turn off googleurl ICU linking
+build --@com_googlesource_googleurl//build_config:system_icu=0
+
+# sanitizers' common flags
+build:sanitizer --define tcmalloc=disabled
+build:sanitizer --linkopt -ldl
+build:sanitizer --build_tag_filters=-no_san
+build:sanitizer --test_tag_filters=-no_san
+
+# clang common flags
+build:clang --action_env=BAZEL_COMPILER=clang
+build:clang --action_env=CC=clang --action_env=CXX=clang++
+build:clang --linkopt=-fuse-ld=lld
+
+# clang + PCH flags
+build:clang-pch --spawn_strategy=local
+build:clang-pch --define=ENVOY_CLANG_PCH=1
+
+# gcc compiler - use gold linker
+build:gcc --linkopt=-fuse-ld=gold
+
+# gcc - ASAN/UBSAN that works
+build:asan --action_env=ENVOY_ASAN=1
+build:asan --config=sanitizer
+# let ASAN print the stacktrace as it will install its signal handler
+# so let's disable ours
+build:asan --define signal_trace=disabled
+build:asan --define ENVOY_CONFIG_ASAN=1
+build:asan --copt -fsanitize=address,undefined
+build:asan --linkopt -fsanitize=address,undefined
