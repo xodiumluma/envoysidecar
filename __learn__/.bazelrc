@@ -78,4 +78,3 @@ build:asan --define ENVOY_CONFIG_ASAN=1
 build:asan --copt -fsanitize=address,undefined
 build:asan --linkopt -fsanitize=address,undefined
 # if clang-asan is configured via bazel/setup_clang.sh then vptr and function sanitizer are turned on
-
