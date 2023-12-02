@@ -2,8 +2,10 @@
 #include "source/extensions/http/header_validators/envoy_default/http1_header_validator.h"
 
 #include "test/extensions/http/header_validators/envoy_default/path_normalizer_fuzz.pb.h"
+#include "test/extensions/http/header_validators/envoy_default/path_normalizer_fuzz.pb.validate.h"
 #include "test/fuzz/fuzz_runner.h"
 #include "test/mocks/http/header_validator.h"
+#include "test/test_common/utility.h"
 
 namespace Envoy {
 
@@ -11,6 +13,14 @@ namespace Envoy {
 DEFINE_PROTO_FUZZER(
     const test::extensions::http::header_validators::envoy_default::PathNormalizerFuzzTestCase&
         input) {
+  // Validate the PGV constraints of the input.
+  try {
+    TestUtility::validate(input);
+  } catch (const EnvoyException& e) {
+    ENVOY_LOG_MISC(debug, "EnvoyException during validation: {}", e.what());
+    return;
+  }
+
   auto header_map = Http::RequestHeaderMapImpl::create();
   Http::HeaderString method;
   Http::HeaderString path;
@@ -20,8 +30,9 @@ DEFINE_PROTO_FUZZER(
   ::envoy::extensions::http::header_validators::envoy_default::v3::HeaderValidatorConfig config;
   *config.mutable_uri_path_normalization_options() = input.options();
   ::testing::NiceMock<Http::MockHeaderValidatorStats> stats_fake;
+  Extensions::Http::HeaderValidators::EnvoyDefault::ConfigOverrides overrides;
   Extensions::Http::HeaderValidators::EnvoyDefault::Http1HeaderValidator validator(
-      config, Http::Protocol::Http11, stats_fake);
+      config, Http::Protocol::Http11, stats_fake, overrides);
   // The character set of the :path and :method headers is validated before normalization.
   // Here we will just not run the test with invalid values
   if (!validator.validateMethodHeader(method) ||
@@ -32,7 +43,7 @@ DEFINE_PROTO_FUZZER(
   header_map->setMethod(method.getStringView());
   header_map->setPath(path.getStringView());
 
-  Extensions::Http::HeaderValidators::EnvoyDefault::PathNormalizer normalizer(config);
+  Extensions::Http::HeaderValidators::EnvoyDefault::PathNormalizer normalizer(config, overrides);
   auto result = normalizer.normalizePathUri(*header_map);
   if (result.ok() || result.action() ==
                          Extensions::Http::HeaderValidators::EnvoyDefault::PathNormalizer::

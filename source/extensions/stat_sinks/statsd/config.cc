@@ -37,7 +37,7 @@ StatsdSinkFactory::createStatsSink(const Protobuf::Message& config,
   case envoy::config::metrics::v3::StatsdSink::StatsdSpecifierCase::STATSD_SPECIFIER_NOT_SET:
     break; // Fall through to PANIC
   }
-  throw EnvoyException("unexpected statsd specifier case num");
+  PANIC("unexpected statsd specifier case num");
 }
 
 ProtobufTypes::MessagePtr StatsdSinkFactory::createEmptyConfigProto() {
@@ -49,7 +49,7 @@ std::string StatsdSinkFactory::name() const { return StatsdName; }
 /**
  * Static registration for the statsd sink factory. @see RegisterFactory.
  */
-REGISTER_FACTORY(StatsdSinkFactory, Server::Configuration::StatsSinkFactory){"envoy.statsd"};
+LEGACY_REGISTER_FACTORY(StatsdSinkFactory, Server::Configuration::StatsSinkFactory, "envoy.statsd");
 
 } // namespace Statsd
 } // namespace StatSinks

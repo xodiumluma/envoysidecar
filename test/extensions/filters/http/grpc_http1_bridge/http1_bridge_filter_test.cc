@@ -11,7 +11,6 @@
 #include "test/mocks/http/mocks.h"
 #include "test/test_common/global.h"
 #include "test/test_common/printers.h"
-#include "test/test_common/test_runtime.h"
 #include "test/test_common/utility.h"
 
 #include "gmock/gmock.h"
@@ -258,7 +257,7 @@ TEST_F(GrpcHttp1BridgeFilterTest, ProtobufUpgradedToGrpc) {
   initialize(true);
   Http::TestRequestHeaderMapImpl request_headers{{"content-type", "application/x-protobuf"},
                                                  {":path", "/v1/spotify.Concat/Concat"}};
-  Buffer::OwnedImpl data("hello");
+  Buffer::OwnedImpl data("helloworld");
 
   EXPECT_CALL(decoder_callbacks_.downstream_callbacks_, clearRouteCache());
   EXPECT_EQ(Http::FilterHeadersStatus::Continue, filter_->decodeHeaders(request_headers, false));
@@ -275,6 +274,9 @@ TEST_F(GrpcHttp1BridgeFilterTest, ProtobufUpgradedToGrpc) {
   EXPECT_EQ(Http::FilterHeadersStatus::StopIteration,
             filter_->encodeHeaders(response_headers, false));
   EXPECT_EQ(Http::FilterDataStatus::StopIterationAndBuffer, filter_->encodeData(data, false));
+  EXPECT_EQ("world", data.toString());
+  EXPECT_EQ(Http::FilterDataStatus::StopIterationAndBuffer, filter_->encodeData(data, false));
+  EXPECT_EQ("world", data.toString());
   Http::TestResponseTrailerMapImpl response_trailers{{"hello", "world"}};
   EXPECT_EQ(Http::FilterTrailersStatus::Continue, filter_->encodeTrailers(response_trailers));
   EXPECT_EQ("200", response_headers.get_(":status"));

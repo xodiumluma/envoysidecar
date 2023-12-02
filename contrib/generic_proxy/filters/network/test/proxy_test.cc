@@ -2,6 +2,8 @@
 #include <string>
 #include <utility>
 
+#include "source/common/tracing/tracer_manager_impl.h"
+
 #include "test/mocks/server/factory_context.h"
 #include "test/test_common/registry.h"
 #include "test/test_common/utility.h"
@@ -24,6 +26,11 @@ namespace NetworkFilters {
 namespace GenericProxy {
 namespace {
 
+static const std::string DEFAULT_LOG_FORMAT =
+    "%HOST% %PATH% %METHOD% %PROTOCOL% %REQUEST_PROPERTY(request-key)% "
+    "%RESPONSE_PROPERTY(response-key)% "
+    "%REQUEST_PROPERTY(non-exist-key)%";
+
 class MockRouteConfigProvider : public Rds::RouteConfigProvider {
 public:
   MockRouteConfigProvider() { ON_CALL(*this, config()).WillByDefault(Return(route_config_)); }
@@ -31,14 +38,29 @@ public:
   MOCK_METHOD(Rds::ConfigConstSharedPtr, config, (), (const));
   MOCK_METHOD(const absl::optional<Rds::RouteConfigProvider::ConfigInfo>&, configInfo, (), (const));
   MOCK_METHOD(SystemTime, lastUpdated, (), (const));
-  MOCK_METHOD(void, onConfigUpdate, ());
+  MOCK_METHOD(absl::Status, onConfigUpdate, ());
 
   std::shared_ptr<NiceMock<MockRouteMatcher>> route_config_{new NiceMock<MockRouteMatcher>()};
 };
 
 class FilterConfigTest : public testing::Test {
 public:
-  void initializeFilterConfig() {
+  void initializeFilterConfig(bool with_tracing = false, AccessLogInstanceSharedPtr logger = {}) {
+    if (with_tracing) {
+      tracer_ = std::make_shared<NiceMock<Tracing::MockTracer>>();
+
+      const std::string tracing_config_yaml = R"EOF(
+      max_path_tag_length: 128
+      )EOF";
+
+      Tracing::ConnectionManagerTracingConfigProto tracing_config;
+
+      TestUtility::loadFromYaml(tracing_config_yaml, tracing_config);
+
+      tracing_config_ = std::make_unique<Tracing::ConnectionManagerTracingConfigImpl>(
+          envoy::config::core::v3::TrafficDirection::OUTBOUND, tracing_config);
+    }
+
     std::vector<NamedFilterFactoryCb> factories;
 
     for (const auto& filter : mock_stream_filters_) {
@@ -63,10 +85,30 @@ public:
 
     mock_route_entry_ = std::make_shared<NiceMock<MockRouteEntry>>();
 
-    filter_config_ =
-        std::make_shared<FilterConfigImpl>("test_prefix", std::move(codec_factory),
-                                           route_config_provider_, factories, factory_context_);
+    std::vector<AccessLogInstanceSharedPtr> access_logs;
+    if (logger) {
+      access_logs.push_back(logger);
+    }
+
+    filter_config_ = std::make_shared<FilterConfigImpl>(
+        "test_prefix", std::move(codec_factory), route_config_provider_, factories, tracer_,
+        std::move(tracing_config_), std::move(access_logs), factory_context_);
   }
+
+  AccessLogInstanceSharedPtr loggerFormFormat(const std::string& format = DEFAULT_LOG_FORMAT) {
+    envoy::config::core::v3::SubstitutionFormatString sff_config;
+    sff_config.mutable_text_format_source()->set_inline_string(format);
+    auto formatter =
+        Envoy::Formatter::SubstitutionFormatStringUtils::fromProtoConfig<FormatterContext>(
+            sff_config, factory_context_);
+
+    return std::make_shared<FileAccessLog>(
+        Filesystem::FilePathAndType{}, nullptr, std::move(formatter),
+        factory_context_.server_factory_context_.accessLogManager());
+  }
+
+  std::shared_ptr<NiceMock<Tracing::MockTracer>> tracer_;
+  Tracing::ConnectionManagerTracingConfigPtr tracing_config_;
 
   std::shared_ptr<FilterConfig> filter_config_;
   NiceMock<Server::Configuration::MockFactoryContext> factory_context_;
@@ -134,26 +176,20 @@ TEST_F(FilterConfigTest, CodecFactory) {
 
 class FilterTest : public FilterConfigTest {
 public:
-  void initializeFilter() {
-    FilterConfigTest::initializeFilterConfig();
+  void initializeFilter(bool with_tracing = false, AccessLogInstanceSharedPtr logger = {}) {
+    FilterConfigTest::initializeFilterConfig(with_tracing, logger);
 
-    auto encoder = std::make_unique<NiceMock<MockResponseEncoder>>();
-    encoder_ = encoder.get();
-    EXPECT_CALL(*codec_factory_, responseEncoder()).WillOnce(Return(ByMove(std::move(encoder))));
+    auto server_codec = std::make_unique<NiceMock<MockServerCodec>>();
+    server_codec_ = server_codec.get();
+    EXPECT_CALL(*codec_factory_, createServerCodec())
+        .WillOnce(Return(ByMove(std::move(server_codec))));
 
-    auto decoder = std::make_unique<NiceMock<MockRequestDecoder>>();
-    decoder_ = decoder.get();
-    EXPECT_CALL(*codec_factory_, requestDecoder()).WillOnce(Return(ByMove(std::move(decoder))));
-
-    auto creator = std::make_unique<NiceMock<MockMessageCreator>>();
-    creator_ = creator.get();
-    EXPECT_CALL(*codec_factory_, messageCreator()).WillOnce(Return(ByMove(std::move(creator))));
-
-    EXPECT_CALL(*decoder_, setDecoderCallback(_))
+    EXPECT_CALL(*server_codec_, setCodecCallbacks(_))
         .WillOnce(
-            Invoke([this](RequestDecoderCallback& callback) { decoder_callback_ = &callback; }));
+            Invoke([this](ServerCodecCallbacks& callback) { decoder_callback_ = &callback; }));
 
-    filter_ = std::make_shared<Filter>(filter_config_);
+    filter_ = std::make_shared<Filter>(filter_config_, factory_context_.time_system_,
+                                       factory_context_.runtime_loader_);
 
     EXPECT_EQ(filter_.get(), decoder_callback_);
 
@@ -162,11 +198,9 @@ public:
 
   std::shared_ptr<Filter> filter_;
 
-  RequestDecoderCallback* decoder_callback_{};
+  ServerCodecCallbacks* decoder_callback_{};
 
-  NiceMock<MockRequestDecoder>* decoder_;
-  NiceMock<MockResponseEncoder>* encoder_;
-  NiceMock<MockMessageCreator>* creator_;
+  NiceMock<MockServerCodec>* server_codec_{};
 
   NiceMock<Network::MockReadFilterCallbacks> filter_callbacks_;
 };
@@ -181,7 +215,7 @@ TEST_F(FilterTest, SimpleOnData) {
 
   Buffer::OwnedImpl fake_empty_buffer;
 
-  EXPECT_CALL(*decoder_, decode(_));
+  EXPECT_CALL(*server_codec_, decode(_, _));
   filter_->onData(fake_empty_buffer, false);
 }
 
@@ -190,7 +224,7 @@ TEST_F(FilterTest, OnDecodingFailureWithoutActiveStreams) {
 
   Buffer::OwnedImpl fake_empty_buffer;
 
-  EXPECT_CALL(*decoder_, decode(_));
+  EXPECT_CALL(*server_codec_, decode(_, _));
   filter_->onData(fake_empty_buffer, false);
 
   EXPECT_CALL(filter_callbacks_.connection_, close(_));
@@ -207,7 +241,7 @@ TEST_F(FilterTest, OnDecodingSuccessWithNormalRequest) {
 
   Buffer::OwnedImpl fake_empty_buffer;
 
-  EXPECT_CALL(*decoder_, decode(_));
+  EXPECT_CALL(*server_codec_, decode(_, _));
   filter_->onData(fake_empty_buffer, false);
 
   auto request = std::make_unique<FakeStreamCodecFactory::FakeRequest>();
@@ -240,7 +274,7 @@ TEST_F(FilterTest, OnConnectionClosedEvent) {
 TEST_F(FilterTest, SendReplyDownstream) {
   initializeFilter();
 
-  NiceMock<MockResponseEncoderCallback> encoder_callback;
+  NiceMock<MockEncodingCallbacks> encoder_callback;
 
   auto response = std::make_unique<FakeStreamCodecFactory::FakeResponse>();
 
@@ -249,24 +283,24 @@ TEST_F(FilterTest, SendReplyDownstream) {
   EXPECT_CALL(filter_callbacks_.connection_, write(BufferStringEqual("test"), false));
 
   EXPECT_CALL(encoder_callback, onEncodingSuccess(_, _))
-      .WillOnce(Invoke([&](Buffer::Instance& buffer, bool close_connection) {
-        filter_callbacks_.connection_.write(buffer, close_connection);
+      .WillOnce(Invoke([&](Buffer::Instance& buffer, bool) {
+        filter_callbacks_.connection_.write(buffer, false);
       }));
 
-  EXPECT_CALL(*encoder_, encode(_, _))
-      .WillOnce(Invoke([&](const Response&, ResponseEncoderCallback& callback) {
+  EXPECT_CALL(*server_codec_, encode(_, _))
+      .WillOnce(Invoke([&](const StreamFrame&, EncodingCallbacks& callback) {
         Buffer::OwnedImpl buffer;
         buffer.add("test");
-        callback.onEncodingSuccess(buffer, false);
+        callback.onEncodingSuccess(buffer, true);
       }));
 
-  filter_->sendReplyDownstream(*response, encoder_callback);
+  filter_->sendFrameToDownstream(*response, encoder_callback);
 }
 
 TEST_F(FilterTest, GetConnection) {
   initializeFilter();
 
-  EXPECT_EQ(&(filter_callbacks_.connection_), &filter_->connection());
+  EXPECT_EQ(&(filter_callbacks_.connection_), &filter_->downstreamConnection());
 }
 
 TEST_F(FilterTest, NewStreamAndResetStream) {
@@ -274,7 +308,7 @@ TEST_F(FilterTest, NewStreamAndResetStream) {
 
   auto request = std::make_unique<FakeStreamCodecFactory::FakeRequest>();
 
-  filter_->newDownstreamRequest(std::move(request));
+  filter_->onDecodingSuccess(std::move(request));
   EXPECT_EQ(1, filter_->activeStreamsForTest().size());
 
   auto active_stream = filter_->activeStreamsForTest().begin()->get();
@@ -297,7 +331,7 @@ TEST_F(FilterTest, NewStreamAndResetStreamFromFilter) {
 
   auto request = std::make_unique<FakeStreamCodecFactory::FakeRequest>();
 
-  filter_->newDownstreamRequest(std::move(request));
+  filter_->onDecodingSuccess(std::move(request));
   EXPECT_EQ(1, filter_->activeStreamsForTest().size());
 
   auto active_stream = filter_->activeStreamsForTest().begin()->get();
@@ -314,7 +348,7 @@ TEST_F(FilterTest, NewStreamAndDispatcher) {
 
   auto request = std::make_unique<FakeStreamCodecFactory::FakeRequest>();
 
-  filter_->newDownstreamRequest(std::move(request));
+  filter_->onDecodingSuccess(std::move(request));
   EXPECT_EQ(1, filter_->activeStreamsForTest().size());
 
   auto active_stream = filter_->activeStreamsForTest().begin()->get();
@@ -326,15 +360,15 @@ TEST_F(FilterTest, OnDecodingFailureWithActiveStreams) {
   initializeFilter();
 
   auto request_0 = std::make_unique<FakeStreamCodecFactory::FakeRequest>();
-  filter_->newDownstreamRequest(std::move(request_0));
+  filter_->onDecodingSuccess(std::move(request_0));
 
   auto request_1 = std::make_unique<FakeStreamCodecFactory::FakeRequest>();
-  filter_->newDownstreamRequest(std::move(request_1));
+  filter_->onDecodingSuccess(std::move(request_1));
 
   EXPECT_EQ(2, filter_->activeStreamsForTest().size());
 
   Buffer::OwnedImpl fake_empty_buffer;
-  EXPECT_CALL(*decoder_, decode(_));
+  EXPECT_CALL(*server_codec_, decode(_, _));
   filter_->onData(fake_empty_buffer, false);
 
   EXPECT_CALL(filter_callbacks_.connection_, close(_));
@@ -348,7 +382,7 @@ TEST_F(FilterTest, ActiveStreamRouteEntry) {
 
   auto request = std::make_unique<FakeStreamCodecFactory::FakeRequest>();
 
-  filter_->newDownstreamRequest(std::move(request));
+  filter_->onDecodingSuccess(std::move(request));
   EXPECT_EQ(1, filter_->activeStreamsForTest().size());
 
   auto active_stream = filter_->activeStreamsForTest().begin()->get();
@@ -364,7 +398,7 @@ TEST_F(FilterTest, ActiveStreamPerFilterConfig) {
   EXPECT_CALL(*route_matcher_, routeEntry(_)).WillOnce(Return(mock_route_entry_));
 
   auto request = std::make_unique<FakeStreamCodecFactory::FakeRequest>();
-  filter_->newDownstreamRequest(std::move(request));
+  filter_->onDecodingSuccess(std::move(request));
   EXPECT_EQ(1, filter_->activeStreamsForTest().size());
 
   auto active_stream = filter_->activeStreamsForTest().begin()->get();
@@ -388,7 +422,7 @@ TEST_F(FilterTest, ActiveStreamPerFilterConfigNoRouteEntry) {
   EXPECT_CALL(*route_matcher_, routeEntry(_)).WillOnce(Return(nullptr));
 
   auto request = std::make_unique<FakeStreamCodecFactory::FakeRequest>();
-  filter_->newDownstreamRequest(std::move(request));
+  filter_->onDecodingSuccess(std::move(request));
   EXPECT_EQ(1, filter_->activeStreamsForTest().size());
 
   auto active_stream = filter_->activeStreamsForTest().begin()->get();
@@ -401,12 +435,33 @@ TEST_F(FilterTest, ActiveStreamPerFilterConfigNoRouteEntry) {
   EXPECT_EQ(nullptr, active_stream->decoderFiltersForTest()[0]->perFilterConfig());
 }
 
+TEST_F(FilterTest, ActiveStreamConnection) {
+  mock_stream_filters_.push_back(
+      {"fake_test_filter_name_0", std::make_shared<NiceMock<MockStreamFilter>>()});
+
+  initializeFilter();
+
+  auto request = std::make_unique<FakeStreamCodecFactory::FakeRequest>();
+  filter_->onDecodingSuccess(std::move(request));
+  EXPECT_EQ(1, filter_->activeStreamsForTest().size());
+
+  auto active_stream = filter_->activeStreamsForTest().begin()->get();
+
+  EXPECT_EQ(1, active_stream->decoderFiltersForTest().size());
+  EXPECT_EQ(1, active_stream->encoderFiltersForTest().size());
+  EXPECT_EQ(1, active_stream->nextDecoderFilterIndexForTest());
+  EXPECT_EQ(0, active_stream->nextEncoderFilterIndexForTest());
+
+  EXPECT_EQ(&filter_callbacks_.connection_,
+            active_stream->decoderFiltersForTest()[0]->connection());
+}
+
 TEST_F(FilterTest, ActiveStreamAddFilters) {
   initializeFilter();
 
   auto request = std::make_unique<FakeStreamCodecFactory::FakeRequest>();
 
-  filter_->newDownstreamRequest(std::move(request));
+  filter_->onDecodingSuccess(std::move(request));
   EXPECT_EQ(1, filter_->activeStreamsForTest().size());
 
   auto active_stream = filter_->activeStreamsForTest().begin()->get();
@@ -454,7 +509,7 @@ TEST_F(FilterTest, ActiveStreamAddFiltersOrder) {
 
   auto request = std::make_unique<FakeStreamCodecFactory::FakeRequest>();
 
-  filter_->newDownstreamRequest(std::move(request));
+  filter_->onDecodingSuccess(std::move(request));
   EXPECT_EQ(1, filter_->activeStreamsForTest().size());
 
   auto active_stream = filter_->activeStreamsForTest().begin()->get();
@@ -492,7 +547,7 @@ TEST_F(FilterTest, ActiveStreamFiltersContinueDecoding) {
 
   auto request = std::make_unique<FakeStreamCodecFactory::FakeRequest>();
 
-  filter_->newDownstreamRequest(std::move(request));
+  filter_->onDecodingSuccess(std::move(request));
   EXPECT_EQ(1, filter_->activeStreamsForTest().size());
 
   auto active_stream = filter_->activeStreamsForTest().begin()->get();
@@ -531,7 +586,7 @@ TEST_F(FilterTest, ActiveStreamFiltersContinueEncoding) {
 
   auto request = std::make_unique<FakeStreamCodecFactory::FakeRequest>();
 
-  filter_->newDownstreamRequest(std::move(request));
+  filter_->onDecodingSuccess(std::move(request));
   EXPECT_EQ(1, filter_->activeStreamsForTest().size());
 
   auto active_stream = filter_->activeStreamsForTest().begin()->get();
@@ -544,16 +599,16 @@ TEST_F(FilterTest, ActiveStreamFiltersContinueEncoding) {
   EXPECT_EQ(0, active_stream->nextEncoderFilterIndexForTest());
 
   auto response = std::make_unique<FakeStreamCodecFactory::FakeResponse>();
-  // `continueEncoding` will be called in the `upstreamResponse`.
-  active_stream->upstreamResponse(std::move(response));
+  // `continueEncoding` will be called in the `onResponseStart`.
+  active_stream->onResponseStart(std::move(response));
 
   // Encoding will be stopped when `onStreamEncoded` of `mock_stream_filter_1` is called.
   EXPECT_EQ(2, active_stream->nextEncoderFilterIndexForTest());
 
-  EXPECT_CALL(filter_callbacks_.connection_, write(BufferStringEqual("test"), true));
+  EXPECT_CALL(filter_callbacks_.connection_, write(BufferStringEqual("test"), false));
 
-  EXPECT_CALL(*encoder_, encode(_, _))
-      .WillOnce(Invoke([&](const Response&, ResponseEncoderCallback& callback) {
+  EXPECT_CALL(*server_codec_, encode(_, _))
+      .WillOnce(Invoke([&](const StreamFrame&, EncodingCallbacks& callback) {
         Buffer::OwnedImpl buffer;
         buffer.add("test");
         callback.onEncodingSuccess(buffer, true);
@@ -567,24 +622,24 @@ TEST_F(FilterTest, ActiveStreamSendLocalReply) {
 
   auto request = std::make_unique<FakeStreamCodecFactory::FakeRequest>();
 
-  filter_->newDownstreamRequest(std::move(request));
+  filter_->onDecodingSuccess(std::move(request));
   EXPECT_EQ(1, filter_->activeStreamsForTest().size());
 
   auto active_stream = filter_->activeStreamsForTest().begin()->get();
 
-  EXPECT_CALL(*creator_, response(_, _))
-      .WillOnce(Invoke([&](Status status, const Request&) -> ResponsePtr {
+  EXPECT_CALL(*server_codec_, respond(_, _, _))
+      .WillOnce(Invoke([&](Status status, absl::string_view, const Request&) -> ResponsePtr {
         auto response = std::make_unique<FakeStreamCodecFactory::FakeResponse>();
         response->status_ = std::move(status);
         return response;
       }));
 
-  EXPECT_CALL(filter_callbacks_.connection_, write(BufferStringEqual("test"), true));
+  EXPECT_CALL(filter_callbacks_.connection_, write(BufferStringEqual("test"), false));
 
-  EXPECT_CALL(*encoder_, encode(_, _))
-      .WillOnce(Invoke([&](const Response& response, ResponseEncoderCallback& callback) {
+  EXPECT_CALL(*server_codec_, encode(_, _))
+      .WillOnce(Invoke([&](const StreamFrame& response, EncodingCallbacks& callback) {
         Buffer::OwnedImpl buffer;
-        EXPECT_EQ(response.status().message(), "test_detail");
+        EXPECT_EQ(dynamic_cast<const Response*>(&response)->status().message(), "test_detail");
         buffer.add("test");
         callback.onEncodingSuccess(buffer, true);
       }));
@@ -597,7 +652,7 @@ TEST_F(FilterTest, ActiveStreamCompleteDirectly) {
 
   auto request = std::make_unique<FakeStreamCodecFactory::FakeRequest>();
 
-  filter_->newDownstreamRequest(std::move(request));
+  filter_->onDecodingSuccess(std::move(request));
   EXPECT_EQ(1, filter_->activeStreamsForTest().size());
 
   auto active_stream = filter_->activeStreamsForTest().begin()->get();
@@ -614,7 +669,7 @@ TEST_F(FilterTest, ActiveStreamCompleteDirectlyFromFilter) {
 
   auto request = std::make_unique<FakeStreamCodecFactory::FakeRequest>();
 
-  filter_->newDownstreamRequest(std::move(request));
+  filter_->onDecodingSuccess(std::move(request));
   EXPECT_EQ(1, filter_->activeStreamsForTest().size());
 
   auto active_stream = filter_->activeStreamsForTest().begin()->get();
@@ -628,29 +683,115 @@ TEST_F(FilterTest, NewStreamAndReplyNormally) {
   auto mock_decoder_filter_0 = std::make_shared<NiceMock<MockDecoderFilter>>();
   mock_decoder_filters_ = {{"mock_0", mock_decoder_filter_0}};
 
-  initializeFilter();
+  // The logger is used to test the log format.
+  initializeFilter(false, loggerFormFormat());
 
   auto request = std::make_unique<FakeStreamCodecFactory::FakeRequest>();
+  request->host_ = "host-value";
+  request->path_ = "/path-value";
+  request->method_ = "method-value";
+  request->protocol_ = "protocol-value";
+  request->data_["request-key"] = "request-value";
 
-  filter_->newDownstreamRequest(std::move(request));
+  filter_->onDecodingSuccess(std::move(request));
   EXPECT_EQ(1, filter_->activeStreamsForTest().size());
 
   auto active_stream = filter_->activeStreamsForTest().begin()->get();
 
-  EXPECT_CALL(filter_callbacks_.connection_, write(BufferStringEqual("test"), true));
+  EXPECT_CALL(filter_callbacks_.connection_, write(BufferStringEqual("test"), false));
 
-  EXPECT_CALL(*encoder_, encode(_, _))
-      .WillOnce(Invoke([&](const Response&, ResponseEncoderCallback& callback) {
+  EXPECT_CALL(*server_codec_, encode(_, _))
+      .WillOnce(Invoke([&](const StreamFrame&, EncodingCallbacks& callback) {
         Buffer::OwnedImpl buffer;
         buffer.add("test");
         callback.onEncodingSuccess(buffer, true);
       }));
 
+  EXPECT_CALL(
+      *factory_context_.server_factory_context_.access_log_manager_.file_,
+      write("host-value /path-value method-value protocol-value request-value response-value -"));
+
   EXPECT_CALL(factory_context_.drain_manager_, drainClose()).WillOnce(Return(false));
   EXPECT_CALL(filter_callbacks_.connection_.dispatcher_, deferredDelete_(_));
 
   auto response = std::make_unique<FakeStreamCodecFactory::FakeResponse>();
-  active_stream->upstreamResponse(std::move(response));
+  response->data_["response-key"] = "response-value";
+
+  active_stream->onResponseStart(std::move(response));
+}
+
+TEST_F(FilterTest, NewStreamAndReplyNormallyWithMultipleFrames) {
+  auto mock_decoder_filter_0 = std::make_shared<NiceMock<MockDecoderFilter>>();
+  mock_decoder_filters_ = {{"mock_0", mock_decoder_filter_0}};
+
+  NiceMock<MockStreamFrameHandler> mock_stream_frame_handler;
+
+  EXPECT_CALL(*mock_decoder_filter_0, setDecoderFilterCallbacks(_))
+      .WillOnce(Invoke([&mock_stream_frame_handler](DecoderFilterCallback& callbacks) {
+        callbacks.setRequestFramesHandler(mock_stream_frame_handler);
+      }));
+
+  // The logger is used to test the log format.
+  initializeFilter(false, loggerFormFormat());
+
+  auto request = std::make_unique<FakeStreamCodecFactory::FakeRequest>();
+  request->host_ = "host-value";
+  request->path_ = "/path-value";
+  request->method_ = "method-value";
+  request->protocol_ = "protocol-value";
+  request->data_["request-key"] = "request-value";
+  request->stream_frame_flags_ = FrameFlags(StreamFlags(), false);
+
+  // The first frame is not the end stream and we will create a frame handler for it.
+  filter_->onDecodingSuccess(std::move(request));
+  EXPECT_EQ(1, filter_->activeStreamsForTest().size());
+  EXPECT_EQ(1, filter_->frameHandlersForTest().size());
+
+  // stream_frame_handler will be called twice to handle the two frames (except the first
+  // StreamRequest frame).
+  EXPECT_CALL(mock_stream_frame_handler, onStreamFrame(_)).Times(2);
+
+  auto request_frame_1 = std::make_unique<FakeStreamCodecFactory::FakeRequest>();
+  request_frame_1->stream_frame_flags_ = FrameFlags(StreamFlags(), false);
+  filter_->onDecodingSuccess(std::move(request_frame_1));
+  EXPECT_EQ(1, filter_->activeStreamsForTest().size());
+  EXPECT_EQ(1, filter_->frameHandlersForTest().size());
+
+  // When the last frame is the end stream, we will delete the frame handler.
+  auto request_frame_2 = std::make_unique<FakeStreamCodecFactory::FakeRequest>();
+  request_frame_2->stream_frame_flags_ = FrameFlags(StreamFlags(), true);
+  filter_->onDecodingSuccess(std::move(request_frame_2));
+  EXPECT_EQ(1, filter_->activeStreamsForTest().size());
+  EXPECT_EQ(0, filter_->frameHandlersForTest().size());
+
+  auto active_stream = filter_->activeStreamsForTest().begin()->get();
+
+  EXPECT_CALL(
+      *factory_context_.server_factory_context_.access_log_manager_.file_,
+      write("host-value /path-value method-value protocol-value request-value response-value -"));
+
+  EXPECT_CALL(factory_context_.drain_manager_, drainClose()).WillOnce(Return(false));
+  EXPECT_CALL(filter_callbacks_.connection_.dispatcher_, deferredDelete_(_));
+
+  EXPECT_CALL(filter_callbacks_.connection_, write(BufferStringEqual("test"), false)).Times(2);
+  EXPECT_CALL(*server_codec_, encode(_, _))
+      .Times(2)
+      .WillRepeatedly(Invoke([&](const StreamFrame& frame, EncodingCallbacks& callback) {
+        Buffer::OwnedImpl buffer;
+        buffer.add("test");
+        callback.onEncodingSuccess(buffer, frame.frameFlags().endStream());
+      }));
+
+  auto response = std::make_unique<FakeStreamCodecFactory::FakeResponse>();
+  response->data_["response-key"] = "response-value";
+  response->stream_frame_flags_ = FrameFlags(StreamFlags(), false);
+
+  active_stream->onResponseStart(std::move(response));
+
+  auto response_frame_1 = std::make_unique<FakeStreamCodecFactory::FakeResponse>();
+  response_frame_1->stream_frame_flags_ = FrameFlags(StreamFlags(), true);
+
+  active_stream->onResponseFrame(std::move(response_frame_1));
 }
 
 TEST_F(FilterTest, NewStreamAndReplyNormallyWithDrainClose) {
@@ -661,15 +802,15 @@ TEST_F(FilterTest, NewStreamAndReplyNormallyWithDrainClose) {
 
   auto request = std::make_unique<FakeStreamCodecFactory::FakeRequest>();
 
-  filter_->newDownstreamRequest(std::move(request));
+  filter_->onDecodingSuccess(std::move(request));
   EXPECT_EQ(1, filter_->activeStreamsForTest().size());
 
   auto active_stream = filter_->activeStreamsForTest().begin()->get();
 
-  EXPECT_CALL(filter_callbacks_.connection_, write(BufferStringEqual("test"), true));
+  EXPECT_CALL(filter_callbacks_.connection_, write(BufferStringEqual("test"), false));
 
-  EXPECT_CALL(*encoder_, encode(_, _))
-      .WillOnce(Invoke([&](const Response&, ResponseEncoderCallback& callback) {
+  EXPECT_CALL(*server_codec_, encode(_, _))
+      .WillOnce(Invoke([&](const StreamFrame&, EncodingCallbacks& callback) {
         Buffer::OwnedImpl buffer;
         buffer.add("test");
         callback.onEncodingSuccess(buffer, true);
@@ -680,7 +821,101 @@ TEST_F(FilterTest, NewStreamAndReplyNormallyWithDrainClose) {
   EXPECT_CALL(filter_callbacks_.connection_, close(Network::ConnectionCloseType::FlushWrite));
 
   auto response = std::make_unique<FakeStreamCodecFactory::FakeResponse>();
-  active_stream->upstreamResponse(std::move(response));
+  active_stream->onResponseStart(std::move(response));
+}
+
+TEST_F(FilterTest, NewStreamAndReplyNormallyWithStreamDrainClose) {
+  auto mock_decoder_filter_0 = std::make_shared<NiceMock<MockDecoderFilter>>();
+  mock_decoder_filters_ = {{"mock_0", mock_decoder_filter_0}};
+
+  initializeFilter();
+
+  auto request = std::make_unique<FakeStreamCodecFactory::FakeRequest>();
+
+  filter_->onDecodingSuccess(std::move(request));
+  EXPECT_EQ(1, filter_->activeStreamsForTest().size());
+
+  auto active_stream = filter_->activeStreamsForTest().begin()->get();
+
+  EXPECT_CALL(filter_callbacks_.connection_, write(BufferStringEqual("test"), false));
+
+  EXPECT_CALL(*server_codec_, encode(_, _))
+      .WillOnce(Invoke([&](const StreamFrame&, EncodingCallbacks& callback) {
+        Buffer::OwnedImpl buffer;
+        buffer.add("test");
+        callback.onEncodingSuccess(buffer, true);
+      }));
+
+  // The drain close of factory_context_.drain_manager_ is false, but the drain close of
+  // active_stream is true.
+  EXPECT_CALL(factory_context_.drain_manager_, drainClose()).WillOnce(Return(false));
+  EXPECT_CALL(filter_callbacks_.connection_.dispatcher_, deferredDelete_(_));
+  EXPECT_CALL(filter_callbacks_.connection_, close(Network::ConnectionCloseType::FlushWrite));
+
+  auto response = std::make_unique<FakeStreamCodecFactory::FakeResponse>();
+  response->stream_frame_flags_ = FrameFlags(StreamFlags(0, false, true, false), true);
+  active_stream->onResponseStart(std::move(response));
+}
+
+TEST_F(FilterTest, NewStreamAndReplyNormallyWithTracing) {
+  auto mock_decoder_filter_0 = std::make_shared<NiceMock<MockDecoderFilter>>();
+  mock_decoder_filters_ = {{"mock_0", mock_decoder_filter_0}};
+
+  initializeFilter(true);
+
+  auto request = std::make_unique<FakeStreamCodecFactory::FakeRequest>();
+
+  auto* span = new NiceMock<Tracing::MockSpan>();
+  EXPECT_CALL(*tracer_, startSpan_(_, _, _, _))
+      .WillOnce(
+          Invoke([&](const Tracing::Config& config, Tracing::TraceContext&,
+                     const StreamInfo::StreamInfo&, const Tracing::Decision) -> Tracing::Span* {
+            EXPECT_EQ(Tracing::OperationName::Egress, config.operationName());
+            return span;
+          }));
+
+  filter_->onDecodingSuccess(std::move(request));
+  EXPECT_EQ(1, filter_->activeStreamsForTest().size());
+
+  auto active_stream = filter_->activeStreamsForTest().begin()->get();
+
+  EXPECT_CALL(*span, setTag(_, _)).Times(testing::AnyNumber());
+  EXPECT_CALL(*span, finishSpan());
+
+  EXPECT_CALL(filter_callbacks_.connection_, write(BufferStringEqual("test"), false));
+
+  EXPECT_CALL(*server_codec_, encode(_, _))
+      .WillOnce(Invoke([&](const StreamFrame&, EncodingCallbacks& callback) {
+        Buffer::OwnedImpl buffer;
+        buffer.add("test");
+        callback.onEncodingSuccess(buffer, true);
+      }));
+
+  EXPECT_CALL(factory_context_.drain_manager_, drainClose()).WillOnce(Return(false));
+  EXPECT_CALL(filter_callbacks_.connection_.dispatcher_, deferredDelete_(_));
+
+  auto response = std::make_unique<FakeStreamCodecFactory::FakeResponse>();
+  active_stream->onResponseStart(std::move(response));
+}
+
+TEST_F(FilterTest, TestStats) {
+  initializeFilter(false);
+  auto request = std::make_unique<FakeStreamCodecFactory::FakeRequest>();
+  request->stream_frame_flags_ = FrameFlags(StreamFlags(123, false, false, false), true);
+
+  filter_->onDecodingSuccess(std::move(request));
+  EXPECT_EQ(1, filter_->activeStreamsForTest().size());
+  EXPECT_EQ(1, filter_config_->stats().request_.value());
+  EXPECT_EQ(1, filter_config_->stats().request_active_.value());
+
+  auto active_stream = filter_->activeStreamsForTest().begin()->get();
+  Buffer::OwnedImpl buffer;
+  buffer.add("123");
+  // Mock response.
+  active_stream->onResponseStart(std::make_unique<FakeStreamCodecFactory::FakeResponse>());
+  active_stream->onEncodingSuccess(buffer, true);
+  EXPECT_EQ(1, filter_config_->stats().response_.value());
+  EXPECT_EQ(0, filter_config_->stats().request_active_.value());
 }
 
 } // namespace

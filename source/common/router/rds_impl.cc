@@ -98,8 +98,8 @@ void RdsRouteConfigSubscription::beforeProviderUpdate(
     ASSERT(config_update_info_->configInfo().has_value());
     maybeCreateInitManager(routeConfigUpdate()->configInfo().value().version_, noop_init_manager,
                            resume_rds);
-    vhds_subscription_ = std::make_unique<VhdsSubscription>(
-        config_update_info_, factory_context_, stat_prefix_, route_config_provider_opt_);
+    vhds_subscription_ = std::make_unique<VhdsSubscription>(config_update_info_, factory_context_,
+                                                            stat_prefix_, route_config_provider_);
     vhds_subscription_->registerInitTargetWithInitManager(
         noop_init_manager == nullptr ? local_init_manager_ : *noop_init_manager);
   }
@@ -150,20 +150,23 @@ RdsRouteConfigProviderImpl::RdsRouteConfigProviderImpl(
   // The subscription referenced by the 'base_' and by 'this' is the same.
   // In it the provider is already set by the 'base_' so it points to that.
   // Need to set again to point to 'this'.
-  base_.subscription().routeConfigProvider().emplace(this);
+  base_.subscription().routeConfigProvider() = this;
 }
 
 RdsRouteConfigSubscription& RdsRouteConfigProviderImpl::subscription() {
   return static_cast<RdsRouteConfigSubscription&>(base_.subscription());
 }
 
-void RdsRouteConfigProviderImpl::onConfigUpdate() {
-  base_.onConfigUpdate();
+absl::Status RdsRouteConfigProviderImpl::onConfigUpdate() {
+  auto status = base_.onConfigUpdate();
+  if (!status.ok()) {
+    return status;
+  }
 
   const auto aliases = config_update_info_->resourceIdsInLastVhdsUpdate();
   // Regular (non-VHDS) RDS updates don't populate aliases fields in resources.
   if (aliases.empty()) {
-    return;
+    return absl::OkStatus();
   }
 
   const auto config =
@@ -189,6 +192,7 @@ void RdsRouteConfigProviderImpl::onConfigUpdate() {
       it++;
     }
   }
+  return absl::OkStatus();
 }
 
 ConfigConstSharedPtr RdsRouteConfigProviderImpl::configCast() const {

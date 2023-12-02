@@ -1,5 +1,6 @@
 #include "engine.h"
 
+#include "library/common/data/utility.h"
 #include "library/common/main_interface.h"
 #include "library/common/types/c_types.h"
 
@@ -7,6 +8,12 @@ namespace Envoy {
 namespace Platform {
 
 Engine::Engine(envoy_engine_t engine) : engine_(engine), terminated_(false) {}
+
+Engine::~Engine() {
+  if (!terminated_) {
+    terminate();
+  }
+}
 
 // we lazily construct the stream and pulse clients
 // because they either require or will require a weak ptr
@@ -18,12 +25,25 @@ StreamClientSharedPtr Engine::streamClient() {
 
 PulseClientSharedPtr Engine::pulseClient() { return std::make_shared<PulseClient>(); }
 
-void Engine::terminate() {
-  if (terminated_) {
-    throw std::runtime_error("attempting to double terminate Engine");
+std::string Engine::dumpStats() {
+  envoy_data data;
+  if (dump_stats(engine_, &data) == ENVOY_FAILURE) {
+    return "";
   }
-  terminate_engine(engine_, /* release */ false);
+  const std::string to_return = Data::Utility::copyToString(data);
+  release_envoy_data(data);
+
+  return to_return;
+}
+
+envoy_status_t Engine::terminate() {
+  if (terminated_) {
+    IS_ENVOY_BUG("attempted to double terminate engine");
+    return ENVOY_FAILURE;
+  }
+  envoy_status_t ret = terminate_engine(engine_, /* release */ false);
   terminated_ = true;
+  return ret;
 }
 
 } // namespace Platform

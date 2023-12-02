@@ -3,10 +3,11 @@
 #include "envoy/network/filter.h"
 
 #include "source/common/network/connection_balancer_impl.h"
-#include "source/server/connection_handler_impl.h"
+#include "source/extensions/listener_managers/listener_manager/connection_handler_impl.h"
 
 #include "test/extensions/filters/listener/common/fuzz/listener_filter_fakes.h"
 #include "test/extensions/filters/listener/common/fuzz/listener_filter_fuzzer.pb.validate.h"
+#include "test/mocks/common.h"
 #include "test/mocks/event/mocks.h"
 #include "test/mocks/network/mocks.h"
 #include "test/test_common/network_utility.h"
@@ -56,16 +57,12 @@ public:
   uint32_t perConnectionBufferLimitBytes() const override { return 0; }
   std::chrono::milliseconds listenerFiltersTimeout() const override { return {}; }
   bool continueOnListenerFiltersTimeout() const override { return false; }
-  Stats::Scope& listenerScope() override { return stats_store_; }
+  Stats::Scope& listenerScope() override { return *stats_store_.rootScope(); }
   uint64_t listenerTag() const override { return 1; }
   ResourceLimit& openConnections() override { return open_connections_; }
   const std::string& name() const override { return name_; }
-  Network::UdpListenerConfigOptRef udpListenerConfig() override {
-    return Network::UdpListenerConfigOptRef();
-  }
-  Network::InternalListenerConfigOptRef internalListenerConfig() override {
-    return Network::InternalListenerConfigOptRef();
-  }
+  Network::UdpListenerConfigOptRef udpListenerConfig() override { return {}; }
+  Network::InternalListenerConfigOptRef internalListenerConfig() override { return {}; }
   envoy::config::core::v3::TrafficDirection direction() const override {
     return envoy::config::core::v3::UNSPECIFIED;
   }
@@ -76,6 +73,9 @@ public:
     return empty_access_logs_;
   }
   uint32_t tcpBacklogSize() const override { return ENVOY_TCP_BACKLOG_SIZE; }
+  uint32_t maxConnectionsToAcceptPerSocketEvent() const override {
+    return Network::DefaultMaxConnectionsToAcceptPerSocketEvent;
+  }
   Init::Manager& initManager() override { return *init_manager_; }
   bool ignoreGlobalConnLimit() const override { return false; }
 
@@ -98,6 +98,7 @@ private:
   void disconnect();
 
   testing::NiceMock<Runtime::MockLoader> runtime_;
+  testing::NiceMock<Random::MockRandomGenerator> random_;
   Stats::TestUtil::TestStore stats_store_;
   Api::ApiPtr api_;
   BasicResourceLimitImpl open_connections_;

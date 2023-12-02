@@ -101,7 +101,7 @@ std::string CidrRange::asString() const {
 // static
 CidrRange CidrRange::create(InstanceConstSharedPtr address, int length) {
   InstanceConstSharedPtr ptr = truncateIpAddressAndLength(std::move(address), &length);
-  return CidrRange(std::move(ptr), length);
+  return {std::move(ptr), length};
 }
 
 // static
@@ -132,7 +132,7 @@ CidrRange CidrRange::create(const std::string& range) {
       }
     }
   }
-  return CidrRange(nullptr, -1);
+  return {nullptr, -1};
 }
 
 // static
@@ -201,7 +201,7 @@ IpList::IpList(const Protobuf::RepeatedPtrField<envoy::config::core::v3::CidrRan
     if (list_entry.isValid()) {
       ip_list_.push_back(std::move(list_entry));
     } else {
-      throw EnvoyException(
+      throwEnvoyExceptionOrPanic(
           fmt::format("invalid ip/mask combo '{}/{}' (format is <ip>/<# mask bits>)",
                       entry.address_prefix(), entry.prefix_len().value()));
     }

@@ -30,12 +30,12 @@ public:
   virtual absl::string_view protocol() const PURE;
 
   /**
-   * Get context authority.
+   * Get context host.
    *
-   * @return The authority of traceable stream. It generally consists of the host and an optional
-   * user information and an optional port.
+   * @return The host of traceable stream. It typically should be domain, VIP, or service name that
+   * used to represents target service instances.
    */
-  virtual absl::string_view authority() const PURE;
+  virtual absl::string_view host() const PURE;
 
   /**
    * Get context path.
@@ -93,6 +93,14 @@ public:
    * @param val The context value of string view type.
    */
   virtual void setByReference(absl::string_view key, absl::string_view val) PURE;
+
+  /**
+   * Removes the following key and its associated values from the tracing
+   * context.
+   *
+   * @param key The key to remove if it exists.
+   */
+  virtual void removeByKey(absl::string_view key) PURE;
 };
 
 } // namespace Tracing

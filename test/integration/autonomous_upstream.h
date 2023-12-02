@@ -46,6 +46,7 @@ class AutonomousHttpConnection : public FakeHttpConnection {
 public:
   AutonomousHttpConnection(AutonomousUpstream& autonomous_upstream,
                            SharedConnectionWrapper& shared_connection, Http::CodecType type,
+                           uint32_t max_request_headers_kb, uint32_t max_request_headers_count,
                            AutonomousUpstream& upstream);
 
   Http::RequestDecoder& newStream(Http::ResponseEncoder& response_encoder, bool) override;
@@ -81,19 +82,22 @@ public:
   ~AutonomousUpstream() override;
   bool
   createNetworkFilterChain(Network::Connection& connection,
-                           const std::vector<Network::FilterFactoryCb>& filter_factories) override;
+                           const Filter::NetworkFilterFactoriesList& filter_factories) override;
   bool createListenerFilterChain(Network::ListenerFilterManager& listener) override;
   void createUdpListenerFilterChain(Network::UdpListenerFilterManager& listener,
                                     Network::UdpReadFilterCallbacks& callbacks) override;
+  bool createQuicListenerFilterChain(Network::QuicListenerFilterManager& listener) override;
   AssertionResult closeConnection(uint32_t index,
                                   std::chrono::milliseconds timeout = TestUtility::DefaultTimeout);
 
   void setLastRequestHeaders(const Http::HeaderMap& headers);
   std::unique_ptr<Http::TestRequestHeaderMapImpl> lastRequestHeaders();
   void setResponseTrailers(std::unique_ptr<Http::TestResponseTrailerMapImpl>&& response_trailers);
+  void setResponseBody(std::string body);
   void setResponseHeaders(std::unique_ptr<Http::TestResponseHeaderMapImpl>&& response_headers);
   void setPreResponseHeadersMetadata(std::unique_ptr<Http::MetadataMapVector>&& metadata);
   Http::TestResponseTrailerMapImpl responseTrailers();
+  absl::optional<std::string> responseBody();
   Http::TestResponseHeaderMapImpl responseHeaders();
   std::unique_ptr<Http::MetadataMapVector> preResponseHeadersMetadata();
   const bool allow_incomplete_streams_{false};
@@ -102,6 +106,7 @@ private:
   Thread::MutexBasicLockable headers_lock_;
   std::unique_ptr<Http::TestRequestHeaderMapImpl> last_request_headers_;
   std::unique_ptr<Http::TestResponseTrailerMapImpl> response_trailers_;
+  absl::optional<std::string> response_body_;
   std::unique_ptr<Http::TestResponseHeaderMapImpl> response_headers_;
   std::unique_ptr<Http::MetadataMapVector> pre_response_headers_metadata_;
   std::vector<AutonomousHttpConnectionPtr> http_connections_;

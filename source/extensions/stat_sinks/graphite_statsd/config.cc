@@ -40,7 +40,7 @@ GraphiteStatsdSinkFactory::createStatsSink(const Protobuf::Message& config,
       STATSD_SPECIFIER_NOT_SET:
     break;
   }
-  throw EnvoyException("unexpected statsd specifier enum");
+  PANIC("unexpected statsd specifier enum");
 }
 
 ProtobufTypes::MessagePtr GraphiteStatsdSinkFactory::createEmptyConfigProto() {
@@ -52,8 +52,8 @@ std::string GraphiteStatsdSinkFactory::name() const { return "envoy.stat_sinks.g
 /**
  * Static registration for the statsd sink factory. @see RegisterFactory.
  */
-REGISTER_FACTORY(GraphiteStatsdSinkFactory,
-                 Server::Configuration::StatsSinkFactory){"envoy.graphite_statsd"};
+LEGACY_REGISTER_FACTORY(GraphiteStatsdSinkFactory, Server::Configuration::StatsSinkFactory,
+                        "envoy.graphite_statsd");
 
 } // namespace GraphiteStatsd
 } // namespace StatSinks

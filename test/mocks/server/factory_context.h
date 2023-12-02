@@ -67,12 +67,14 @@ public:
   testing::NiceMock<MockServerLifecycleNotifier> lifecycle_notifier_;
   testing::NiceMock<LocalInfo::MockLocalInfo> local_info_;
   testing::NiceMock<Envoy::Runtime::MockLoader> runtime_loader_;
-  testing::NiceMock<Stats::MockIsolatedStatsStore> scope_;
+  testing::NiceMock<Stats::MockIsolatedStatsStore> store_;
+  Stats::Scope& scope_{*store_.rootScope()};
   testing::NiceMock<ThreadLocal::MockInstance> thread_local_;
   testing::NiceMock<Server::MockOptions> options_;
   Singleton::ManagerPtr singleton_manager_;
   testing::NiceMock<MockAdmin> admin_;
-  Stats::IsolatedStoreImpl listener_scope_;
+  Stats::IsolatedStoreImpl listener_store_;
+  Stats::Scope& listener_scope_{*listener_store_.rootScope()};
   Event::GlobalTimeSystem time_system_;
   testing::NiceMock<ProtobufMessage::MockValidationContext> validation_context_;
   testing::NiceMock<MockOverloadManager> overload_manager_;
@@ -82,16 +84,17 @@ public:
   testing::NiceMock<Api::MockApi> api_;
 };
 
-class MockUpstreamHttpFactoryContext : public UpstreamHttpFactoryContext {
+class MockUpstreamFactoryContext : public UpstreamFactoryContext {
 public:
-  MockUpstreamHttpFactoryContext();
+  MockUpstreamFactoryContext();
 
   MOCK_METHOD(ServerFactoryContext&, getServerFactoryContext, (), (const));
   MOCK_METHOD(Init::Manager&, initManager, ());
   MOCK_METHOD(Stats::Scope&, scope, ());
   testing::NiceMock<Init::MockManager> init_manager_;
   testing::NiceMock<MockServerFactoryContext> server_factory_context_;
-  testing::NiceMock<Stats::MockIsolatedStatsStore> scope_;
+  testing::NiceMock<Stats::MockIsolatedStatsStore> store_;
+  Stats::Scope& scope_{*store_.rootScope()};
 };
 
 } // namespace Configuration

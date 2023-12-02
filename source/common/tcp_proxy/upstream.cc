@@ -49,16 +49,28 @@ bool TcpUpstream::startUpstreamSecureTransport() {
              : upstream_conn_data_->connection().startSecureTransport();
 }
 
+Ssl::ConnectionInfoConstSharedPtr TcpUpstream::getUpstreamConnectionSslInfo() {
+  if (upstream_conn_data_ != nullptr) {
+    return upstream_conn_data_->connection().ssl();
+  }
+  return nullptr;
+}
+
 Tcp::ConnectionPool::ConnectionData*
 TcpUpstream::onDownstreamEvent(Network::ConnectionEvent event) {
+  // TODO(botengyao): propagate RST back to upstream connection if RST is received from downstream.
   if (event == Network::ConnectionEvent::RemoteClose) {
     // The close call may result in this object being deleted. Latch the
     // connection locally so it can be returned for potential draining.
     auto* conn_data = upstream_conn_data_.release();
-    conn_data->connection().close(Network::ConnectionCloseType::FlushWrite);
+    conn_data->connection().close(
+        Network::ConnectionCloseType::FlushWrite,
+        StreamInfo::LocalCloseReasons::get().ClosingUpstreamTcpDueToDownstreamRemoteClose);
     return conn_data;
   } else if (event == Network::ConnectionEvent::LocalClose) {
-    upstream_conn_data_->connection().close(Network::ConnectionCloseType::NoFlush);
+    upstream_conn_data_->connection().close(
+        Network::ConnectionCloseType::NoFlush,
+        StreamInfo::LocalCloseReasons::get().ClosingUpstreamTcpDueToDownstreamLocalClose);
   }
   return nullptr;
 }
@@ -155,8 +167,9 @@ void HttpUpstream::doneWriting() {
 
 TcpConnPool::TcpConnPool(Upstream::ThreadLocalCluster& thread_local_cluster,
                          Upstream::LoadBalancerContext* context,
-                         Tcp::ConnectionPool::UpstreamCallbacks& upstream_callbacks)
-    : upstream_callbacks_(upstream_callbacks) {
+                         Tcp::ConnectionPool::UpstreamCallbacks& upstream_callbacks,
+                         StreamInfo::StreamInfo& downstream_info)
+    : upstream_callbacks_(upstream_callbacks), downstream_info_(downstream_info) {
   conn_pool_data_ = thread_local_cluster.tcpConnPool(Upstream::ResourcePriority::Default, context);
 }
 
@@ -188,6 +201,12 @@ void TcpConnPool::onPoolFailure(ConnectionPool::PoolFailureReason reason,
 
 void TcpConnPool::onPoolReady(Tcp::ConnectionPool::ConnectionDataPtr&& conn_data,
                               Upstream::HostDescriptionConstSharedPtr host) {
+  if (downstream_info_.downstreamAddressProvider().connectionID()) {
+    ENVOY_LOG(debug, "Attached upstream connection [C{}] to downstream connection [C{}]",
+              conn_data->connection().id(),
+              downstream_info_.downstreamAddressProvider().connectionID().value());
+  }
+
   upstream_handle_ = nullptr;
   Tcp::ConnectionPool::ConnectionData* latched_data = conn_data.get();
   Network::Connection& connection = conn_data->connection();
@@ -250,6 +269,15 @@ void HttpConnPool::onPoolFailure(ConnectionPool::PoolFailureReason reason,
 void HttpConnPool::onPoolReady(Http::RequestEncoder& request_encoder,
                                Upstream::HostDescriptionConstSharedPtr host,
                                StreamInfo::StreamInfo& info, absl::optional<Http::Protocol>) {
+  if (info.downstreamAddressProvider().connectionID() &&
+      downstream_info_.downstreamAddressProvider().connectionID()) {
+    // info.downstreamAddressProvider() is being called to get the upstream connection ID,
+    // because the StreamInfo object here is of the upstream connection.
+    ENVOY_LOG(debug, "Attached upstream connection [C{}] to downstream connection [C{}]",
+              info.downstreamAddressProvider().connectionID().value(),
+              downstream_info_.downstreamAddressProvider().connectionID().value());
+  }
+
   upstream_handle_ = nullptr;
   upstream_->setRequestEncoder(request_encoder,
                                host->transportSocketFactory().implementsSecureTransport());
@@ -289,18 +317,9 @@ void Http2Upstream::setRequestEncoder(Http::RequestEncoder& request_encoder, boo
   if (config_.usePost()) {
     headers->addReference(Http::Headers::get().Path, config_.postPath());
     headers->addReference(Http::Headers::get().Scheme, scheme);
-  } else if (!Runtime::runtimeFeatureEnabled("envoy.reloadable_features.use_rfc_connect")) {
-    headers->addReference(Http::Headers::get().Path, "/");
-    headers->addReference(Http::Headers::get().Scheme, scheme);
-    headers->addReference(Http::Headers::get().Protocol,
-                          Http::Headers::get().ProtocolValues.Bytestream);
   }
 
-  config_.headerEvaluator().evaluateHeaders(*headers,
-                                            downstream_info_.getRequestHeaders() == nullptr
-                                                ? *Http::StaticEmptyHeaders::get().request_headers
-                                                : *downstream_info_.getRequestHeaders(),
-                                            *Http::StaticEmptyHeaders::get().response_headers,
+  config_.headerEvaluator().evaluateHeaders(*headers, {downstream_info_.getRequestHeaders()},
                                             downstream_info_);
   const auto status = request_encoder_->encodeHeaders(*headers, false);
   // Encoding can only fail on missing required request headers.
@@ -328,11 +347,7 @@ void Http1Upstream::setRequestEncoder(Http::RequestEncoder& request_encoder, boo
     headers->addReference(Http::Headers::get().Path, config_.postPath());
   }
 
-  config_.headerEvaluator().evaluateHeaders(*headers,
-                                            downstream_info_.getRequestHeaders() == nullptr
-                                                ? *Http::StaticEmptyHeaders::get().request_headers
-                                                : *downstream_info_.getRequestHeaders(),
-                                            *Http::StaticEmptyHeaders::get().response_headers,
+  config_.headerEvaluator().evaluateHeaders(*headers, {downstream_info_.getRequestHeaders()},
                                             downstream_info_);
   const auto status = request_encoder_->encodeHeaders(*headers, false);
   // Encoding can only fail on missing required request headers.

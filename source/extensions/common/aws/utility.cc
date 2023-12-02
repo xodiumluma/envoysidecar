@@ -1,13 +1,18 @@
 #include "source/extensions/common/aws/utility.h"
 
+#include "envoy/upstream/cluster_manager.h"
+
 #include "source/common/common/empty_string.h"
 #include "source/common/common/fmt.h"
 #include "source/common/common/utility.h"
+#include "source/common/protobuf/message_validator_impl.h"
+#include "source/common/protobuf/utility.h"
 
 #include "absl/strings/match.h"
 #include "absl/strings/str_join.h"
 #include "absl/strings/str_split.h"
 #include "curl/curl.h"
+#include "fmt/printf.h"
 
 namespace Envoy {
 namespace Extensions {
@@ -20,8 +25,8 @@ constexpr absl::string_view QUERY_SEPERATOR = "&";
 constexpr absl::string_view QUERY_SPLITTER = "?";
 constexpr absl::string_view RESERVED_CHARS = "-._~";
 constexpr absl::string_view S3_SERVICE_NAME = "s3";
-const std::string URI_ENCODE = "%{:02X}";
-const std::string URI_DOUBLE_ENCODE = "%25{:02X}";
+constexpr absl::string_view URI_ENCODE = "%{:02X}";
+constexpr absl::string_view URI_DOUBLE_ENCODE = "%25{:02X}";
 
 std::map<std::string, std::string>
 Utility::canonicalizeHeaders(const Http::RequestHeaderMap& headers,
@@ -59,7 +64,7 @@ Utility::canonicalizeHeaders(const Http::RequestHeaderMap& headers,
       });
   // The AWS SDK has a quirk where it removes "default ports" (80, 443) from the host headers
   // Additionally, we canonicalize the :authority header as "host"
-  // TODO(lavignes): This may need to be tweaked to canonicalize :authority for HTTP/2 requests
+  // TODO(suniltheta): This may need to be tweaked to canonicalize :authority for HTTP/2 requests
   const absl::string_view authority_header = headers.getHostValue();
   if (!authority_header.empty()) {
     const auto parts = StringUtil::splitToken(authority_header, ":");
@@ -235,6 +240,7 @@ absl::optional<std::string> Utility::fetchMetadata(Http::RequestMessage& message
 
   const auto host = message.headers().getHostValue();
   const auto path = message.headers().getPathValue();
+  const auto method = message.headers().getMethodValue();
 
   const std::string url = fmt::format("http://{}{}", host, path);
   curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
@@ -257,6 +263,22 @@ absl::optional<std::string> Utility::fetchMetadata(Http::RequestMessage& message
     headers = curl_slist_append(headers, header.c_str());
     return Http::HeaderMap::Iterate::Continue;
   });
+
+  // This function only support doing PUT(UPLOAD) other than GET(_default_) operation.
+  if (Http::Headers::get().MethodValues.Put == method) {
+    // https://curl.se/libcurl/c/CURLOPT_PUT.html is deprecated
+    // so using https://curl.se/libcurl/c/CURLOPT_UPLOAD.html.
+    curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L);
+    // To call PUT on HTTP 1.0 we must specify a value for the upload size
+    // since some old EC2's metadata service will be serving on HTTP 1.0.
+    // https://curl.se/libcurl/c/CURLOPT_INFILESIZE.html
+    curl_easy_setopt(curl, CURLOPT_INFILESIZE, 0);
+    // Disabling `Expect: 100-continue` header to get a response
+    // in the first attempt as the put size is zero.
+    // https://everything.curl.dev/http/post/expect100
+    headers = curl_slist_append(headers, "Expect:");
+  }
+
   if (headers != nullptr) {
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
   }
@@ -275,6 +297,57 @@ absl::optional<std::string> Utility::fetchMetadata(Http::RequestMessage& message
   curl_slist_free_all(headers);
 
   return buffer.empty() ? absl::nullopt : absl::optional<std::string>(buffer);
+}
+
+bool Utility::addInternalClusterStatic(
+    Upstream::ClusterManager& cm, absl::string_view cluster_name,
+    const envoy::config::cluster::v3::Cluster::DiscoveryType cluster_type, absl::string_view uri) {
+  // Check if local cluster exists with that name.
+  if (cm.getThreadLocalCluster(cluster_name) == nullptr) {
+    // Make sure we run this on main thread.
+    TRY_ASSERT_MAIN_THREAD {
+      envoy::config::cluster::v3::Cluster cluster;
+      absl::string_view host_port;
+      absl::string_view path;
+      Http::Utility::extractHostPathFromUri(uri, host_port, path);
+      const auto host_attributes = Http::Utility::parseAuthority(host_port);
+      const auto host = host_attributes.host_;
+      const auto port = host_attributes.port_ ? host_attributes.port_.value() : 80;
+
+      cluster.set_name(cluster_name);
+      cluster.set_type(cluster_type);
+      cluster.mutable_connect_timeout()->set_seconds(5);
+      cluster.mutable_load_assignment()->set_cluster_name(cluster_name);
+      auto* endpoint = cluster.mutable_load_assignment()
+                           ->add_endpoints()
+                           ->add_lb_endpoints()
+                           ->mutable_endpoint();
+      auto* addr = endpoint->mutable_address();
+      addr->mutable_socket_address()->set_address(host);
+      addr->mutable_socket_address()->set_port_value(port);
+      cluster.set_lb_policy(envoy::config::cluster::v3::Cluster::ROUND_ROBIN);
+      envoy::extensions::upstreams::http::v3::HttpProtocolOptions protocol_options;
+      auto* http_protocol_options =
+          protocol_options.mutable_explicit_http_config()->mutable_http_protocol_options();
+      http_protocol_options->set_accept_http_10(true);
+      (*cluster.mutable_typed_extension_protocol_options())
+          ["envoy.extensions.upstreams.http.v3.HttpProtocolOptions"]
+              .PackFrom(protocol_options);
+
+      // TODO(suniltheta): use random number generator here for cluster version.
+      cm.addOrUpdateCluster(cluster, "12345");
+      ENVOY_LOG_MISC(info,
+                     "Added a {} internal cluster [name: {}, address:{}:{}] to fetch aws "
+                     "credentials",
+                     cluster_type, cluster_name, host, port);
+    }
+    END_TRY
+    CATCH(const EnvoyException& e, {
+      ENVOY_LOG_MISC(error, "Failed to add internal cluster {}: {}", cluster_name, e.what());
+      return false;
+    });
+  }
+  return true;
 }
 
 } // namespace Aws

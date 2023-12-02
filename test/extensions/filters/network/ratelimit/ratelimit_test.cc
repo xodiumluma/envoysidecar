@@ -47,7 +47,7 @@ public:
 
     envoy::extensions::filters::network::ratelimit::v3::RateLimit proto_config{};
     TestUtility::loadFromYaml(yaml, proto_config);
-    config_ = std::make_shared<Config>(proto_config, stats_store_, runtime_);
+    config_ = std::make_shared<Config>(proto_config, *stats_store_.rootScope(), runtime_);
     client_ = new Filters::Common::RateLimit::MockClient();
     filter_ = std::make_unique<Filter>(config_, Filters::Common::RateLimit::ClientPtr{client_});
 
@@ -136,7 +136,7 @@ TEST_F(RateLimitFilterTest, OK) {
   EXPECT_CALL(*client_, limit(_, "foo",
                               testing::ContainerEq(std::vector<RateLimit::Descriptor>{
                                   {{{"hello", "world"}, {"foo", "bar"}}}, {{{"foo2", "bar2"}}}}),
-                              testing::A<Tracing::Span&>(), _))
+                              testing::A<Tracing::Span&>(), _, 0))
       .WillOnce(
           WithArgs<0>(Invoke([&](Filters::Common::RateLimit::RequestCallbacks& callbacks) -> void {
             request_callbacks_ = &callbacks;
@@ -173,7 +173,7 @@ TEST_F(RateLimitFilterTest, SubstitutionFormatterTest1) {
   EXPECT_CALL(*client_, limit(_, "foo",
                               testing::ContainerEq(std::vector<RateLimit::Descriptor>{
                                   {{{"remote_address", "8.8.8.8"}, {"hello", "HTTP/1.1"}}}}),
-                              testing::A<Tracing::Span&>(), _))
+                              testing::A<Tracing::Span&>(), _, 0))
       .WillOnce(
           WithArgs<0>(Invoke([&](Filters::Common::RateLimit::RequestCallbacks& callbacks) -> void {
             request_callbacks_ = &callbacks;
@@ -224,7 +224,7 @@ TEST_F(RateLimitFilterTest, SubstitutionFormatterTest2) {
   EXPECT_CALL(*client_, limit(_, "foo",
                               testing::ContainerEq(std::vector<RateLimit::Descriptor>{
                                   {{{"remote_address", "8.8.8.8"}, {"hello", "world"}}}}),
-                              testing::A<Tracing::Span&>(), _))
+                              testing::A<Tracing::Span&>(), _, 0))
       .WillOnce(
           WithArgs<0>(Invoke([&](Filters::Common::RateLimit::RequestCallbacks& callbacks) -> void {
             request_callbacks_ = &callbacks;
@@ -254,7 +254,7 @@ TEST_F(RateLimitFilterTest, OverLimit) {
   InSequence s;
   setUpTest(filter_config_);
 
-  EXPECT_CALL(*client_, limit(_, "foo", _, _, _))
+  EXPECT_CALL(*client_, limit(_, "foo", _, _, _, 0))
       .WillOnce(
           WithArgs<0>(Invoke([&](Filters::Common::RateLimit::RequestCallbacks& callbacks) -> void {
             request_callbacks_ = &callbacks;
@@ -264,7 +264,7 @@ TEST_F(RateLimitFilterTest, OverLimit) {
   Buffer::OwnedImpl data("hello");
   EXPECT_EQ(Network::FilterStatus::StopIteration, filter_->onData(data, false));
 
-  EXPECT_CALL(filter_callbacks_.connection_, close(Network::ConnectionCloseType::NoFlush));
+  EXPECT_CALL(filter_callbacks_.connection_, close(Network::ConnectionCloseType::NoFlush, _));
   EXPECT_CALL(*client_, cancel()).Times(0);
   request_callbacks_->complete(Filters::Common::RateLimit::LimitStatus::OverLimit, nullptr, nullptr,
                                nullptr, "", nullptr);
@@ -280,7 +280,7 @@ TEST_F(RateLimitFilterTest, OverLimitWithDynamicMetadata) {
   InSequence s;
   setUpTest(filter_config_);
 
-  EXPECT_CALL(*client_, limit(_, "foo", _, _, _))
+  EXPECT_CALL(*client_, limit(_, "foo", _, _, _, 0))
       .WillOnce(
           WithArgs<0>(Invoke([&](Filters::Common::RateLimit::RequestCallbacks& callbacks) -> void {
             request_callbacks_ = &callbacks;
@@ -304,7 +304,7 @@ TEST_F(RateLimitFilterTest, OverLimitWithDynamicMetadata) {
         EXPECT_TRUE(TestUtility::protoEqual(returned_dynamic_metadata, *dynamic_metadata));
       }));
 
-  EXPECT_CALL(filter_callbacks_.connection_, close(Network::ConnectionCloseType::NoFlush));
+  EXPECT_CALL(filter_callbacks_.connection_, close(Network::ConnectionCloseType::NoFlush, _));
   EXPECT_CALL(*client_, cancel()).Times(0);
   request_callbacks_->complete(Filters::Common::RateLimit::LimitStatus::OverLimit, nullptr, nullptr,
                                nullptr, "", std::move(dynamic_metadata));
@@ -320,7 +320,7 @@ TEST_F(RateLimitFilterTest, OverLimitNotEnforcing) {
   InSequence s;
   setUpTest(filter_config_);
 
-  EXPECT_CALL(*client_, limit(_, "foo", _, _, _))
+  EXPECT_CALL(*client_, limit(_, "foo", _, _, _, 0))
       .WillOnce(
           WithArgs<0>(Invoke([&](Filters::Common::RateLimit::RequestCallbacks& callbacks) -> void {
             request_callbacks_ = &callbacks;
@@ -332,7 +332,7 @@ TEST_F(RateLimitFilterTest, OverLimitNotEnforcing) {
 
   EXPECT_CALL(runtime_.snapshot_, featureEnabled("ratelimit.tcp_filter_enforcing", 100))
       .WillOnce(Return(false));
-  EXPECT_CALL(filter_callbacks_.connection_, close(_)).Times(0);
+  EXPECT_CALL(filter_callbacks_.connection_, close(_, _)).Times(0);
   EXPECT_CALL(*client_, cancel()).Times(0);
   EXPECT_CALL(filter_callbacks_, continueReading());
   request_callbacks_->complete(Filters::Common::RateLimit::LimitStatus::OverLimit, nullptr, nullptr,
@@ -349,7 +349,7 @@ TEST_F(RateLimitFilterTest, Error) {
   InSequence s;
   setUpTest(filter_config_);
 
-  EXPECT_CALL(*client_, limit(_, "foo", _, _, _))
+  EXPECT_CALL(*client_, limit(_, "foo", _, _, _, 0))
       .WillOnce(
           WithArgs<0>(Invoke([&](Filters::Common::RateLimit::RequestCallbacks& callbacks) -> void {
             request_callbacks_ = &callbacks;
@@ -377,7 +377,7 @@ TEST_F(RateLimitFilterTest, Disconnect) {
   InSequence s;
   setUpTest(filter_config_);
 
-  EXPECT_CALL(*client_, limit(_, "foo", _, _, _))
+  EXPECT_CALL(*client_, limit(_, "foo", _, _, _, 0))
       .WillOnce(
           WithArgs<0>(Invoke([&](Filters::Common::RateLimit::RequestCallbacks& callbacks) -> void {
             request_callbacks_ = &callbacks;
@@ -398,7 +398,7 @@ TEST_F(RateLimitFilterTest, ImmediateOK) {
   setUpTest(filter_config_);
 
   EXPECT_CALL(filter_callbacks_, continueReading()).Times(0);
-  EXPECT_CALL(*client_, limit(_, "foo", _, _, _))
+  EXPECT_CALL(*client_, limit(_, "foo", _, _, _, 0))
       .WillOnce(
           WithArgs<0>(Invoke([&](Filters::Common::RateLimit::RequestCallbacks& callbacks) -> void {
             callbacks.complete(Filters::Common::RateLimit::LimitStatus::OK, nullptr, nullptr,
@@ -422,7 +422,7 @@ TEST_F(RateLimitFilterTest, ImmediateError) {
   setUpTest(filter_config_);
 
   EXPECT_CALL(filter_callbacks_, continueReading()).Times(0);
-  EXPECT_CALL(*client_, limit(_, "foo", _, _, _))
+  EXPECT_CALL(*client_, limit(_, "foo", _, _, _, 0))
       .WillOnce(
           WithArgs<0>(Invoke([&](Filters::Common::RateLimit::RequestCallbacks& callbacks) -> void {
             callbacks.complete(Filters::Common::RateLimit::LimitStatus::Error, nullptr, nullptr,
@@ -448,7 +448,7 @@ TEST_F(RateLimitFilterTest, RuntimeDisable) {
 
   EXPECT_CALL(runtime_.snapshot_, featureEnabled("ratelimit.tcp_filter_enabled", 100))
       .WillOnce(Return(false));
-  EXPECT_CALL(*client_, limit(_, _, _, _, _)).Times(0);
+  EXPECT_CALL(*client_, limit(_, _, _, _, _, 0)).Times(0);
 
   EXPECT_EQ(Network::FilterStatus::Continue, filter_->onNewConnection());
   Buffer::OwnedImpl data("hello");
@@ -459,7 +459,7 @@ TEST_F(RateLimitFilterTest, ErrorResponseWithFailureModeAllowOff) {
   InSequence s;
   setUpTest(fail_close_config_);
 
-  EXPECT_CALL(*client_, limit(_, "foo", _, _, _))
+  EXPECT_CALL(*client_, limit(_, "foo", _, _, _, 0))
       .WillOnce(
           WithArgs<0>(Invoke([&](Filters::Common::RateLimit::RequestCallbacks& callbacks) -> void {
             request_callbacks_ = &callbacks;
@@ -548,7 +548,7 @@ stat_prefix: name
   EXPECT_CALL(*rl_client, limit(_, "foo",
                                 testing::ContainerEq(
                                     std::vector<RateLimit::Descriptor>{{{{"hello", "world"}}}}),
-                                testing::A<Tracing::Span&>(), _))
+                                testing::A<Tracing::Span&>(), _, 0))
       .WillOnce(WithArgs<0>(
           Invoke([&](Extensions::Filters::Common::RateLimit::RequestCallbacks& callbacks) -> void {
             request_callbacks = &callbacks;

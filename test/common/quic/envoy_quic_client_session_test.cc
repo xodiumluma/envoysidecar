@@ -28,7 +28,6 @@
 
 using testing::_;
 using testing::Invoke;
-using testing::Return;
 
 namespace Envoy {
 namespace Quic {
@@ -47,7 +46,7 @@ public:
                                   supported_versions, dispatcher, std::move(connection_socket),
                                   generator) {
     SetEncrypter(quic::ENCRYPTION_FORWARD_SECURE,
-                 std::make_unique<quic::NullEncrypter>(quic::Perspective::IS_CLIENT));
+                 std::make_unique<quic::test::TaggingEncrypter>(quic::ENCRYPTION_FORWARD_SECURE));
     SetDefaultEncryptionLevel(quic::ENCRYPTION_FORWARD_SECURE);
   }
 
@@ -79,10 +78,10 @@ public:
         transport_socket_options_(std::make_shared<Network::TransportSocketOptionsImpl>()),
         envoy_quic_session_(quic_config_, quic_version_,
                             std::unique_ptr<TestEnvoyQuicClientConnection>(quic_connection_),
-                            quic::QuicServerId("example.com", 443, false), crypto_config_, nullptr,
+                            quic::QuicServerId("example.com", 443, false), crypto_config_,
                             *dispatcher_,
                             /*send_buffer_limit*/ 1024 * 1024, crypto_stream_factory_,
-                            quic_stat_names_, {}, store_, transport_socket_options_),
+                            quic_stat_names_, {}, *store_.rootScope(), transport_socket_options_),
         stats_({ALL_HTTP3_CODEC_STATS(POOL_COUNTER_PREFIX(store_, "http3."),
                                       POOL_GAUGE_PREFIX(store_, "http3."))}),
         http_connection_(envoy_quic_session_, http_connection_callbacks_, stats_, http3_options_,
@@ -92,7 +91,7 @@ public:
     EXPECT_EQ(Http::Protocol::Http3, http_connection_.protocol());
 
     time_system_.advanceTimeWait(std::chrono::milliseconds(1));
-    ON_CALL(writer_, WritePacket(_, _, _, _, _))
+    ON_CALL(writer_, WritePacket(_, _, _, _, _, _))
         .WillByDefault(testing::Return(quic::WriteResult(quic::WRITE_STATUS_OK, 1)));
   }
 
@@ -162,6 +161,8 @@ protected:
 
 INSTANTIATE_TEST_SUITE_P(EnvoyQuicClientSessionTests, EnvoyQuicClientSessionTest,
                          testing::ValuesIn(quic::CurrentSupportedHttp3Versions()));
+
+TEST_P(EnvoyQuicClientSessionTest, ShutdownNoOp) { http_connection_.shutdownNotice(); }
 
 TEST_P(EnvoyQuicClientSessionTest, NewStream) {
   Http::MockResponseDecoder response_decoder;
@@ -303,7 +304,7 @@ TEST_P(EnvoyQuicClientSessionTest, HandshakeTimesOutWithActiveStream) {
   EXPECT_CALL(*quic_connection_,
               SendConnectionClosePacket(quic::QUIC_HANDSHAKE_FAILED, _, "fake handshake time out"));
   EXPECT_CALL(network_connection_callbacks_, onEvent(Network::ConnectionEvent::LocalClose));
-  EXPECT_CALL(stream_callbacks, onResetStream(Http::StreamResetReason::ConnectionFailure, _));
+  EXPECT_CALL(stream_callbacks, onResetStream(Http::StreamResetReason::LocalConnectionFailure, _));
   envoy_quic_session_.OnStreamError(quic::QUIC_HANDSHAKE_FAILED, "fake handshake time out");
   EXPECT_EQ(Network::Connection::State::Closed, envoy_quic_session_.state());
   EXPECT_TRUE(stream.write_side_closed() && stream.reading_stopped());

@@ -10,7 +10,7 @@
 #include "source/common/network/raw_buffer_socket.h"
 #include "source/extensions/bootstrap/internal_listener/active_internal_listener.h"
 #include "source/extensions/bootstrap/internal_listener/thread_local_registry.h"
-#include "source/server/connection_handler_impl.h"
+#include "source/extensions/listener_managers/listener_manager/connection_handler_impl.h"
 
 #include "test/mocks/access_log/mocks.h"
 #include "test/mocks/common.h"
@@ -163,7 +163,7 @@ TEST_F(ActiveInternalListenerTest, AcceptSocketAndCreateNetworkFilter) {
         return Network::FilterStatus::Continue;
       }));
   EXPECT_CALL(*test_listener_filter, destroy_());
-  auto filter_factory_callback = std::make_shared<std::vector<Network::FilterFactoryCb>>();
+  auto filter_factory_callback = std::make_shared<Filter::NetworkFilterFactoriesList>();
   filter_chain_ = std::make_shared<NiceMock<Network::MockFilterChain>>();
   auto transport_socket_factory = Network::Test::createRawBufferDownstreamSocketFactory();
 
@@ -186,7 +186,7 @@ TEST_F(ActiveInternalListenerTest, AcceptSocketAndCreateNetworkFilter) {
 TEST_F(ActiveInternalListenerTest, StopListener) {
   addListener();
   EXPECT_CALL(*generic_listener_, onDestroy());
-  internal_listener_->shutdownListener();
+  internal_listener_->shutdownListener({});
 }
 
 TEST_F(ActiveInternalListenerTest, PausedListenerAcceptNewSocket) {
@@ -209,7 +209,7 @@ TEST_F(ActiveInternalListenerTest, DestroyListenerCloseAllConnections) {
   expectFilterChainFactory();
   Network::MockConnectionSocket* accepted_socket = new NiceMock<Network::MockConnectionSocket>();
 
-  auto filter_factory_callback = std::make_shared<std::vector<Network::FilterFactoryCb>>();
+  auto filter_factory_callback = std::make_shared<Filter::NetworkFilterFactoriesList>();
   filter_chain_ = std::make_shared<NiceMock<Network::MockFilterChain>>();
   auto transport_socket_factory = Network::Test::createRawBufferDownstreamSocketFactory();
 
@@ -227,6 +227,11 @@ TEST_F(ActiveInternalListenerTest, DestroyListenerCloseAllConnections) {
   internal_listener_->onAccept(Network::ConnectionSocketPtr{accepted_socket});
 
   EXPECT_CALL(conn_handler_, decNumConnections());
+  EXPECT_CALL(*connection, close(_, _))
+      .WillOnce(Invoke([&connection](Network::ConnectionCloseType, absl::string_view details) {
+        EXPECT_EQ(details, "Active Internal Listener destructor");
+        connection->raiseEvent(Network::ConnectionEvent::LocalClose);
+      }));
   internal_listener_.reset();
 }
 
@@ -241,7 +246,7 @@ public:
         .WillByDefault(ReturnPointee(std::shared_ptr<Network::DownstreamTransportSocketFactory>{
             Network::Test::createRawBufferDownstreamSocketFactory()}));
     ON_CALL(*filter_chain_, networkFilterFactories)
-        .WillByDefault(ReturnPointee(std::make_shared<std::vector<Network::FilterFactoryCb>>()));
+        .WillByDefault(ReturnPointee(std::make_shared<Filter::NetworkFilterFactoriesList>()));
     ON_CALL(*listener_filter_matcher_, matches(_)).WillByDefault(Return(false));
   }
 
@@ -307,7 +312,7 @@ public:
     bool continueOnListenerFiltersTimeout() const override {
       return continue_on_listener_filters_timeout_;
     }
-    Stats::Scope& listenerScope() override { return parent_.stats_store_; }
+    Stats::Scope& listenerScope() override { return *parent_.stats_store_.rootScope(); }
     uint64_t listenerTag() const override { return tag_; }
     const std::string& name() const override { return name_; }
     Network::UdpListenerConfigOptRef udpListenerConfig() override { return {}; }
@@ -330,6 +335,9 @@ public:
     }
     ResourceLimit& openConnections() override { return open_connections_; }
     uint32_t tcpBacklogSize() const override { return tcp_backlog_size_; }
+    uint32_t maxConnectionsToAcceptPerSocketEvent() const override {
+      return Network::DefaultMaxConnectionsToAcceptPerSocketEvent;
+    }
     Init::Manager& initManager() override { return *init_manager_; }
     bool ignoreGlobalConnLimit() const override { return ignore_global_conn_limit_; }
     void setMaxConnections(const uint32_t num_connections) {
@@ -389,6 +397,7 @@ public:
   std::shared_ptr<AccessLog::MockInstance> access_log_;
   TestScopedRuntime scoped_runtime_;
   Runtime::Loader& runtime_{scoped_runtime_.loader()};
+  testing::NiceMock<Random::MockRandomGenerator> random_;
 };
 
 TEST_F(ConnectionHandlerTest, DisableInternalListener) {
@@ -402,7 +411,7 @@ TEST_F(ConnectionHandlerTest, DisableInternalListener) {
                   internal_listener->socket_factories_[0].get()),
               localAddress())
       .WillRepeatedly(ReturnRef(local_address));
-  handler_->addListener(absl::nullopt, *internal_listener, runtime_);
+  handler_->addListener(absl::nullopt, *internal_listener, runtime_, random_);
   auto internal_listener_cb = handler_->findByAddress(local_address);
   ASSERT_TRUE(internal_listener_cb.has_value());
 
@@ -430,7 +439,7 @@ TEST_F(ConnectionHandlerTest, InternalListenerInplaceUpdate) {
                   internal_listener->socket_factories_[0].get()),
               localAddress())
       .WillRepeatedly(ReturnRef(local_address));
-  handler_->addListener(absl::nullopt, *internal_listener, runtime_);
+  handler_->addListener(absl::nullopt, *internal_listener, runtime_, random_);
 
   ASSERT_NE(internal_listener, nullptr);
 
@@ -440,7 +449,7 @@ TEST_F(ConnectionHandlerTest, InternalListenerInplaceUpdate) {
       addInternalListener(new_listener_tag, "test_internal_listener", std::chrono::milliseconds(),
                           false, overridden_filter_chain_manager);
 
-  handler_->addListener(old_listener_tag, *new_test_listener, runtime_);
+  handler_->addListener(old_listener_tag, *new_test_listener, runtime_, random_);
 
   Network::MockConnectionSocket* connection = new NiceMock<Network::MockConnectionSocket>();
 
@@ -448,7 +457,7 @@ TEST_F(ConnectionHandlerTest, InternalListenerInplaceUpdate) {
 
   EXPECT_CALL(manager_, findFilterChain(_, _)).Times(0);
   EXPECT_CALL(*overridden_filter_chain_manager, findFilterChain(_, _)).WillOnce(Return(nullptr));
-  EXPECT_CALL(*access_log_, log(_, _, _, _));
+  EXPECT_CALL(*access_log_, log(_, _));
   internal_listener_cb.value().get().onAccept(Network::ConnectionSocketPtr{connection});
   EXPECT_EQ(0UL, handler_->numConnections());
 

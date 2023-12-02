@@ -4,7 +4,6 @@
 
 #include "envoy/config/core/v3/base.pb.h"
 
-#include "source/common/network/listen_socket_impl.h"
 #include "source/common/network/socket_option_factory.h"
 #include "source/common/network/udp_packet_writer_handler_impl.h"
 #include "source/common/quic/envoy_quic_utils.h"
@@ -107,13 +106,10 @@ void EnvoyQuicClientConnection::switchConnectionSocket(
       connection_socket->connectionInfoProvider().remoteAddress()->ip());
 
   // The old socket is not closed in this call, because it could still receive useful packets.
+  num_socket_switches_++;
   setConnectionSocket(std::move(connection_socket));
   setUpConnectionSocket(*connectionSocket(), delegate_);
-  if (connection_migration_use_new_cid()) {
-    MigratePath(self_address, peer_address, writer.release(), true);
-  } else {
-    SetQuicPacketWriter(writer.release(), true);
-  }
+  MigratePath(self_address, peer_address, writer.release(), true);
 }
 
 void EnvoyQuicClientConnection::OnPathDegradingDetected() {
@@ -122,11 +118,16 @@ void EnvoyQuicClientConnection::OnPathDegradingDetected() {
 }
 
 void EnvoyQuicClientConnection::maybeMigratePort() {
-  if (!IsHandshakeConfirmed() || !connection_migration_use_new_cid() ||
-      HasPendingPathValidation() || !migrate_port_on_path_degrading_) {
+  if (!IsHandshakeConfirmed() || HasPendingPathValidation() || !migrate_port_on_path_degrading_ ||
+      num_socket_switches_ >= kMaxNumSocketSwitches) {
     return;
   }
 
+  probeWithNewPort(peer_address(), quic::PathValidationReason::kPortMigration);
+}
+
+void EnvoyQuicClientConnection::probeWithNewPort(const quic::QuicSocketAddress& peer_address,
+                                                 quic::PathValidationReason reason) {
   const Network::Address::InstanceConstSharedPtr& current_local_address =
       connectionSocket()->connectionInfoProvider().localAddress();
   // Creates an IP address with unset port. The port will be set when the new socket is created.
@@ -148,12 +149,11 @@ void EnvoyQuicClientConnection::maybeMigratePort() {
       std::make_unique<Network::UdpDefaultWriter>(probing_socket->ioHandle()));
   quic::QuicSocketAddress self_address = envoyIpAddressToQuicSocketAddress(
       probing_socket->connectionInfoProvider().localAddress()->ip());
-  quic::QuicSocketAddress peer_address = envoyIpAddressToQuicSocketAddress(
-      probing_socket->connectionInfoProvider().remoteAddress()->ip());
 
   auto context = std::make_unique<EnvoyQuicPathValidationContext>(
       self_address, peer_address, std::move(writer), std::move(probing_socket));
-  ValidatePath(std::move(context), std::make_unique<EnvoyPathValidationResultDelegate>(*this));
+  ValidatePath(std::move(context), std::make_unique<EnvoyPathValidationResultDelegate>(*this),
+               reason);
 }
 
 void EnvoyQuicClientConnection::onPathValidationSuccess(
@@ -162,10 +162,19 @@ void EnvoyQuicClientConnection::onPathValidationSuccess(
       static_cast<EnvoyQuicClientConnection::EnvoyQuicPathValidationContext*>(context.get());
 
   auto probing_socket = envoy_context->releaseSocket();
-  if (MigratePath(envoy_context->self_address(), envoy_context->peer_address(),
-                  envoy_context->releaseWriter(), true)) {
+  if (envoy_context->peer_address() != peer_address()) {
+    OnServerPreferredAddressValidated(*envoy_context, true);
+    envoy_context->releaseWriter();
+  } else {
+    MigratePath(envoy_context->self_address(), envoy_context->peer_address(),
+                envoy_context->releaseWriter(), true);
+  }
+
+  if (self_address() == envoy_context->self_address() &&
+      peer_address() == envoy_context->peer_address()) {
     // probing_socket will be set as the new default socket. But old sockets are still able to
     // receive packets.
+    num_socket_switches_++;
     setConnectionSocket(std::move(probing_socket));
     return;
   }
@@ -175,10 +184,10 @@ void EnvoyQuicClientConnection::onPathValidationSuccess(
 }
 
 void EnvoyQuicClientConnection::onPathValidationFailure(
-    std::unique_ptr<quic::QuicPathValidationContext> /*context*/) {
+    std::unique_ptr<quic::QuicPathValidationContext> context) {
   // Note that the probing socket and probing writer will be deleted once context goes out of
   // scope.
-  OnPathValidationFailureAtClient(/*is_multi_port=*/false);
+  OnPathValidationFailureAtClient(/*is_multi_port=*/false, *context);
 }
 
 void EnvoyQuicClientConnection::onFileEvent(uint32_t events,
@@ -230,7 +239,7 @@ void EnvoyQuicClientConnection::setNumPtosForPortMigration(uint32_t num_ptos_for
 }
 
 EnvoyQuicClientConnection::EnvoyQuicPathValidationContext::EnvoyQuicPathValidationContext(
-    quic::QuicSocketAddress& self_address, quic::QuicSocketAddress& peer_address,
+    const quic::QuicSocketAddress& self_address, const quic::QuicSocketAddress& peer_address,
     std::unique_ptr<EnvoyQuicPacketWriter> writer,
     std::unique_ptr<Network::ConnectionSocket> probing_socket)
     : QuicPathValidationContext(self_address, peer_address), writer_(std::move(writer)),
@@ -274,6 +283,12 @@ void EnvoyQuicClientConnection::EnvoyPathValidationResultDelegate::OnPathValidat
 void EnvoyQuicClientConnection::OnCanWrite() {
   quic::QuicConnection::OnCanWrite();
   onWriteEventDone();
+}
+
+void EnvoyQuicClientConnection::probeAndMigrateToServerPreferredAddress(
+    const quic::QuicSocketAddress& server_preferred_address) {
+  probeWithNewPort(server_preferred_address,
+                   quic::PathValidationReason::kServerPreferredAddressMigration);
 }
 
 } // namespace Quic

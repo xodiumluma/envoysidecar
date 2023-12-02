@@ -25,6 +25,10 @@ namespace {
 template <typename T> constexpr T maybeOverride(absl::string_view /*name*/, T val) { return val; }
 
 template <> constexpr bool maybeOverride<bool>(absl::string_view name, bool val) {
+  if (name == "quic_reloadable_flag_quic_limit_sending_max_streams2") {
+    // Causes CI failures for RetryStreamingCancelDueToBufferOverflow
+    return false;
+  }
   if (name == "quic_reloadable_flag_quic_disable_version_draft_29") {
     // Envoy only supports RFC-v1 in the long term, so disable IETF draft 29 implementation by
     // default.
@@ -63,14 +67,6 @@ template <> constexpr int32_t maybeOverride<int32_t>(absl::string_view name, int
 // Flag definitions
 #define QUIC_FLAG(flag, value) ABSL_FLAG(bool, envoy_##flag, maybeOverride(#flag, value), "");
 #include "quiche/quic/core/quic_flags_list.h"
-QUIC_FLAG(quic_reloadable_flag_spdy_testonly_default_false, false)  // NOLINT
-QUIC_FLAG(quic_reloadable_flag_spdy_testonly_default_true, true)    // NOLINT
-QUIC_FLAG(quic_restart_flag_spdy_testonly_default_false, false)     // NOLINT
-QUIC_FLAG(quic_restart_flag_spdy_testonly_default_true, true)       // NOLINT
-QUIC_FLAG(quic_reloadable_flag_http2_testonly_default_false, false) // NOLINT
-QUIC_FLAG(quic_reloadable_flag_http2_testonly_default_true, true)   // NOLINT
-QUIC_FLAG(quic_restart_flag_http2_testonly_default_false, false)    // NOLINT
-QUIC_FLAG(quic_restart_flag_http2_testonly_default_true, true)      // NOLINT
 #undef QUIC_FLAG
 
 #define DEFINE_PROTOCOL_FLAG_IMPL(type, flag, value, help)                                         \

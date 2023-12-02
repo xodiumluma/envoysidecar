@@ -29,8 +29,8 @@ envoy_proto_library(
         "utility_test_message_field_wip.proto",
     ],
     deps = [
-        "@com_github_cncf_udpa//udpa/annotations:pkg",
-        "@com_github_cncf_udpa//xds/annotations/v3:pkg",
+        "@com_github_cncf_xds//udpa/annotations:pkg",
+        "@com_github_cncf_xds//xds/annotations/v3:pkg",
     ],
 )
 
@@ -59,10 +59,18 @@ envoy_cc_test(
         "@envoy_api//envoy/config/bootstrap/v3:pkg_cc_proto",
         "@envoy_api//envoy/config/cluster/v3:pkg_cc_proto",
         "@envoy_api//envoy/config/core/v3:pkg_cc_proto",
-        "@envoy_api//envoy/config/health_checker/redis/v2:pkg_cc_proto",
-        "@envoy_api//envoy/extensions/clusters/dynamic_forward_proxy/v3:pkg_cc_proto",
-        "@envoy_api//envoy/extensions/health_checkers/redis/v3:pkg_cc_proto",
         "@envoy_api//envoy/type/v3:pkg_cc_proto",
+    ],
+)
+
+envoy_cc_test(
+    name = "proto_descriptor_test",
+    srcs = ["proto_descriptor_test.cc"],
+    deps = [
+        "@envoy_api//bazel/cc_proto_descriptor_library:create_dynamic_message",
+        "@envoy_api//bazel/cc_proto_descriptor_library:text_format_transcoder",
+        "@envoy_api//envoy/config/core/v3:pkg_cc_proto",
+        "@envoy_api//envoy/config/core/v3:pkg_cc_proto_descriptor",
     ],
 )
 

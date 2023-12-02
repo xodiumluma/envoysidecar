@@ -15,11 +15,14 @@
 namespace Envoy {
 namespace TcpProxy {
 
+constexpr absl::string_view DisableTunnelingFilterStateKey = "envoy.tcp_proxy.disable_tunneling";
+
 class TcpConnPool : public GenericConnPool, public Tcp::ConnectionPool::Callbacks {
 public:
   TcpConnPool(Upstream::ThreadLocalCluster& thread_local_cluster,
               Upstream::LoadBalancerContext* context,
-              Tcp::ConnectionPool::UpstreamCallbacks& upstream_callbacks);
+              Tcp::ConnectionPool::UpstreamCallbacks& upstream_callbacks,
+              StreamInfo::StreamInfo& downstream_info);
   ~TcpConnPool() override;
 
   bool valid() const { return conn_pool_data_.has_value(); }
@@ -39,6 +42,7 @@ private:
   Tcp::ConnectionPool::Cancellable* upstream_handle_{};
   GenericConnectionPoolCallbacks* callbacks_{};
   Tcp::ConnectionPool::UpstreamCallbacks& upstream_callbacks_;
+  StreamInfo::StreamInfo& downstream_info_;
 };
 
 class HttpUpstream;
@@ -115,6 +119,7 @@ public:
   void addBytesSentCallback(Network::Connection::BytesSentCb cb) override;
   Tcp::ConnectionPool::ConnectionData* onDownstreamEvent(Network::ConnectionEvent event) override;
   bool startUpstreamSecureTransport() override;
+  Ssl::ConnectionInfoConstSharedPtr getUpstreamConnectionSslInfo() override;
 
 private:
   Tcp::ConnectionPool::ConnectionDataPtr upstream_conn_data_;
@@ -151,6 +156,7 @@ public:
   void setConnPoolCallbacks(std::unique_ptr<HttpConnPool::Callbacks>&& callbacks) {
     conn_pool_callbacks_ = std::move(callbacks);
   }
+  Ssl::ConnectionInfoConstSharedPtr getUpstreamConnectionSslInfo() override { return nullptr; }
 
 protected:
   HttpUpstream(Tcp::ConnectionPool::UpstreamCallbacks& callbacks,
@@ -171,11 +177,12 @@ private:
     // Http::ResponseDecoder
     void decode1xxHeaders(Http::ResponseHeaderMapPtr&&) override {}
     void decodeHeaders(Http::ResponseHeaderMapPtr&& headers, bool end_stream) override {
-      if (!parent_.isValidResponse(*headers) || end_stream) {
+      bool is_valid_response = parent_.isValidResponse(*headers);
+      parent_.config_.propagateResponseHeaders(std::move(headers),
+                                               parent_.downstream_info_.filterState());
+      if (!is_valid_response || end_stream) {
         parent_.resetEncoder(Network::ConnectionEvent::LocalClose);
       } else if (parent_.conn_pool_callbacks_ != nullptr) {
-        parent_.config_.propagateResponseHeaders(std::move(headers),
-                                                 parent_.downstream_info_.filterState());
         parent_.conn_pool_callbacks_->onSuccess(*parent_.request_encoder_);
         parent_.conn_pool_callbacks_.reset();
       }
@@ -186,7 +193,11 @@ private:
         parent_.doneReading();
       }
     }
-    void decodeTrailers(Http::ResponseTrailerMapPtr&&) override {}
+    void decodeTrailers(Http::ResponseTrailerMapPtr&& trailers) override {
+      parent_.config_.propagateResponseTrailers(std::move(trailers),
+                                                parent_.downstream_info_.filterState());
+      parent_.doneReading();
+    }
     void decodeMetadata(Http::MetadataMapPtr&&) override {}
     void dumpState(std::ostream& os, int indent_level) const override {
       DUMP_STATE_UNIMPLEMENTED(DecoderShim);

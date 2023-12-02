@@ -197,6 +197,127 @@ TEST_P(RedirectIntegrationTest, BasicInternalRedirect) {
   EXPECT_THAT(waitForAccessLog(access_log_name_, 1), HasSubstr("200 via_upstream -"));
 }
 
+// Test the buggy behavior where Envoy doesn't respond to "Connection: close" header in requests
+// which get redirected.
+// TODO(danzh) remove the test once the runtime guard is deprecated.
+TEST_P(RedirectIntegrationTest, ConnectionCloseHeaderDroppedInInternalRedirect) {
+  config_helper_.addRuntimeOverride(
+      "envoy.reloadable_features.http1_connection_close_header_in_redirect", "false");
+
+  if (downstreamProtocol() != Envoy::Http::CodecClient::Type::HTTP1) {
+    return;
+  }
+  useAccessLog("%RESPONSE_FLAGS% %RESPONSE_CODE% %RESPONSE_CODE_DETAILS% %RESP(test-header)%");
+  // Validate that header sanitization is only called once.
+  config_helper_.addConfigModifier(
+      [](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
+             hcm) {
+        // The delay should be ignored in light of "Connection: close".
+        hcm.mutable_delayed_close_timeout()->set_seconds(1);
+        hcm.set_via("via_value");
+        hcm.mutable_common_http_protocol_options()
+            ->mutable_max_requests_per_connection()
+            ->set_value(10);
+      });
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  default_request_headers_.setHost("handle.internal.redirect");
+  default_request_headers_.setConnection("close");
+  IntegrationStreamDecoderPtr response =
+      codec_client_->makeHeaderOnlyRequest(default_request_headers_);
+
+  waitForNextUpstreamRequest();
+
+  upstream_request_->encodeHeaders(redirect_response_, true);
+  EXPECT_THAT(waitForAccessLog(access_log_name_, 0),
+              HasSubstr("302 internal_redirect test-header-value"));
+
+  waitForNextUpstreamRequest();
+  ASSERT(upstream_request_->headers().EnvoyOriginalUrl() != nullptr);
+  EXPECT_EQ("http://handle.internal.redirect/test/long/url",
+            upstream_request_->headers().getEnvoyOriginalUrlValue());
+  EXPECT_EQ("/new/url", upstream_request_->headers().getPathValue());
+  EXPECT_EQ("authority2", upstream_request_->headers().getHostValue());
+  EXPECT_EQ("via_value", upstream_request_->headers().getViaValue());
+
+  upstream_request_->encodeHeaders(default_response_headers_, true);
+
+  ASSERT_TRUE(response->waitForEndStream());
+  ASSERT_TRUE(response->complete());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+  EXPECT_TRUE(response->headers().get(Envoy::Http::Headers::get().Connection).empty());
+
+  // Envoy won't close the connection with out the fix.
+  ASSERT_FALSE(codec_client_->waitForDisconnect(std::chrono::milliseconds(2000)));
+}
+
+// Test that Envoy should correctly respond to "Connection: close" header in requests which get
+// redirected by echoing "Connection: close" in response and closing the connection immediately.
+TEST_P(RedirectIntegrationTest, ConnectionCloseHeaderHonoredInInternalRedirect) {
+  config_helper_.addRuntimeOverride(
+      "envoy.reloadable_features.http1_connection_close_header_in_redirect", "true");
+
+  if (downstreamProtocol() != Envoy::Http::CodecClient::Type::HTTP1) {
+    return;
+  }
+  useAccessLog("%RESPONSE_FLAGS% %RESPONSE_CODE% %RESPONSE_CODE_DETAILS% %RESP(test-header)%");
+  // Validate that header sanitization is only called once.
+  config_helper_.addConfigModifier(
+      [](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
+             hcm) {
+        // The delay should be ignored in light of "Connection: close".
+        hcm.mutable_delayed_close_timeout()->set_seconds(10);
+        hcm.set_via("via_value");
+        // Make sure connection won't be closed because it only allows 1 request.
+        hcm.mutable_common_http_protocol_options()
+            ->mutable_max_requests_per_connection()
+            ->set_value(10);
+      });
+  initialize();
+
+  codec_client_ = makeHttpConnection(lookupPort("http"));
+
+  default_request_headers_.setHost("handle.internal.redirect");
+  default_request_headers_.setConnection("close");
+  IntegrationStreamDecoderPtr response =
+      codec_client_->makeHeaderOnlyRequest(default_request_headers_);
+
+  waitForNextUpstreamRequest();
+
+  upstream_request_->encodeHeaders(redirect_response_, true);
+  EXPECT_THAT(waitForAccessLog(access_log_name_, 0),
+              HasSubstr("302 internal_redirect test-header-value"));
+
+  waitForNextUpstreamRequest();
+  ASSERT(upstream_request_->headers().EnvoyOriginalUrl() != nullptr);
+  EXPECT_EQ("http://handle.internal.redirect/test/long/url",
+            upstream_request_->headers().getEnvoyOriginalUrlValue());
+  EXPECT_EQ("/new/url", upstream_request_->headers().getPathValue());
+  EXPECT_EQ("authority2", upstream_request_->headers().getHostValue());
+  EXPECT_EQ("via_value", upstream_request_->headers().getViaValue());
+
+  upstream_request_->encodeHeaders(default_response_headers_, true);
+
+  ASSERT_TRUE(response->waitForEndStream());
+  ASSERT_TRUE(response->complete());
+  EXPECT_EQ("200", response->headers().getStatusValue());
+  // "Connection: close" should be sent back in response.
+  EXPECT_THAT(response->headers(),
+              Envoy::Http::HeaderValueOf(Envoy::Http::Headers::get().Connection, "close"));
+
+  // Envoy should close the connection immediately.
+  ASSERT_TRUE(codec_client_->waitForDisconnect(std::chrono::milliseconds(2000)));
+  EXPECT_EQ(codec_client_->lastConnectionEvent(), Envoy::Network::ConnectionEvent::RemoteClose);
+  EXPECT_EQ(1, test_server_->counter("cluster.cluster_0.upstream_internal_redirect_succeeded_total")
+                   ->value());
+
+  // 302 was never returned downstream
+  EXPECT_EQ(0, test_server_->counter("http.config_test.downstream_rq_3xx")->value());
+  EXPECT_EQ(1, test_server_->counter("http.config_test.downstream_rq_2xx")->value());
+}
+
 TEST_P(RedirectIntegrationTest, BasicInternalRedirectDownstreamBytesCount) {
   if (upstreamProtocol() != Http::CodecType::HTTP2) {
     return;
@@ -219,8 +340,7 @@ TEST_P(RedirectIntegrationTest, BasicInternalRedirectDownstreamBytesCount) {
   upstream_request_->encodeHeaders(redirect_response_, true);
   expectDownstreamBytesSentAndReceived(BytesCountExpectation(0, 63, 0, 31),
                                        BytesCountExpectation(0, 42, 0, 42),
-                                       BytesCountExpectation(0, 42, 0, 42), 0);
-
+                                       BytesCountExpectation(0, 8, 0, 6), 0);
   waitForNextUpstreamRequest();
   upstream_request_->encodeHeaders(default_response_headers_, true);
 
@@ -228,7 +348,7 @@ TEST_P(RedirectIntegrationTest, BasicInternalRedirectDownstreamBytesCount) {
   ASSERT_TRUE(response->complete());
   expectDownstreamBytesSentAndReceived(BytesCountExpectation(140, 63, 121, 31),
                                        BytesCountExpectation(77, 42, 77, 42),
-                                       BytesCountExpectation(77, 42, 77, 42), 1);
+                                       BytesCountExpectation(9, 8, 9, 6), 1);
 }
 
 TEST_P(RedirectIntegrationTest, BasicInternalRedirectUpstreamBytesCount) {
@@ -611,9 +731,15 @@ TEST_P(RedirectIntegrationTest, InternalRedirectToDestinationWithResponseBody) {
   config_helper_.addConfigModifier(
       [](envoy::extensions::filters::network::http_connection_manager::v3::HttpConnectionManager&
              hcm) { hcm.set_via("via_value"); });
-  config_helper_.prependFilter(R"EOF(
+  if (downstreamProtocol() == Http::CodecType::HTTP3) {
+    config_helper_.prependFilter(R"EOF(
+  name: pause-filter-for-quic
+  )EOF");
+  } else {
+    config_helper_.prependFilter(R"EOF(
   name: pause-filter
   )EOF");
+  }
   initialize();
 
   codec_client_ = makeHttpConnection(lookupPort("http"));
@@ -695,8 +821,7 @@ TEST_P(RedirectIntegrationTest, InternalRedirectHandledByDirectResponse) {
   ASSERT_TRUE(response->waitForEndStream());
   ASSERT_TRUE(response->complete());
   EXPECT_EQ("204", response->headers().getStatusValue());
-  EXPECT_EQ(1, test_server_->counter("cluster.cluster_0.upstream_internal_redirect_succeeded_total")
-                   ->value());
+  test_server_->waitForCounterEq("cluster.cluster_0.upstream_internal_redirect_succeeded_total", 1);
   // 302 was never returned downstream
   EXPECT_EQ(0, test_server_->counter("http.config_test.downstream_rq_3xx")->value());
   EXPECT_EQ(1, test_server_->counter("http.config_test.downstream_rq_2xx")->value());
@@ -707,7 +832,10 @@ TEST_P(RedirectIntegrationTest, InternalRedirectHandledByDirectResponse) {
 }
 
 INSTANTIATE_TEST_SUITE_P(Protocols, RedirectIntegrationTest,
-                         testing::ValuesIn(HttpProtocolIntegrationTest::getProtocolTestParams()),
+                         testing::ValuesIn(HttpProtocolIntegrationTest::getProtocolTestParams(
+                             {Http::CodecType::HTTP1, Http::CodecType::HTTP2,
+                              Http::CodecType::HTTP3},
+                             {Http::CodecType::HTTP1, Http::CodecType::HTTP2})),
                          HttpProtocolIntegrationTest::protocolTestParamsToString);
 
 } // namespace Envoy

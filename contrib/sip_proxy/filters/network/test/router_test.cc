@@ -40,7 +40,7 @@ class SipRouterTest : public testing::Test {
 public:
   SipRouterTest()
       : router_filter_config_(std::make_shared<NiceMock<MockRouterFilterConfig>>()),
-        router_stats_(RouterFilterConfigImpl::generateStats("test", store_)){};
+        router_stats_(RouterFilterConfigImpl::generateStats("test", *store_.rootScope())){};
   ~SipRouterTest() override { delete (filter_); }
 
   void initializeTrans(const std::string& sip_protocol_options_yaml = "",
@@ -105,13 +105,14 @@ public:
 
     EXPECT_CALL(context_, getTransportSocketFactoryContext())
         .WillRepeatedly(testing::ReturnRef(factory_context_));
-    EXPECT_CALL(factory_context_, localInfo()).WillRepeatedly(testing::ReturnRef(local_info_));
+    EXPECT_CALL(factory_context_.server_context_, localInfo())
+        .WillRepeatedly(testing::ReturnRef(local_info_));
 
     transaction_infos_ = std::make_shared<TransactionInfos>();
     context_.cluster_manager_.initializeThreadLocalClusters({cluster_name_});
 
     StreamInfo::StreamInfoImpl stream_info{time_source_, nullptr};
-    SipFilterStats stat = SipFilterStats::generateStats("test.", store_);
+    SipFilterStats stat = SipFilterStats::generateStats("test.", *store_.rootScope());
     EXPECT_CALL(config_, stats()).WillRepeatedly(ReturnRef(stat));
 
     filter_ =
@@ -456,7 +457,7 @@ TEST_F(SipRouterTest, QueryStop) {
   initializeTrans();
   initializeRouter();
   initializeTransaction();
-  initializeMetadata(MsgType::Request);
+  initializeMetadata(MsgType::Request, MethodType::Invite, false);
   metadata_->affinity().clear();
   metadata_->affinity().emplace_back("Route", "lskpmc", "S1F1", false, false);
   metadata_->resetAffinityIteration();
@@ -464,7 +465,7 @@ TEST_F(SipRouterTest, QueryStop) {
       .WillRepeatedly(
           Invoke([&](const std::string&, const std::string&, const absl::optional<TraContextMap>,
                      SipFilters::DecoderFilterCallbacks&, std::string& host) -> QueryStatus {
-            host = "10.0.0.11";
+            host = "";
             return QueryStatus::Stop;
           }));
   startRequest(FilterStatus::Continue);
@@ -560,7 +561,7 @@ TEST_F(SipRouterTest, DestNotEqualToHost) {
   initializeTrans();
   initializeRouter();
   initializeTransaction();
-  initializeMetadata(MsgType::Request);
+  initializeMetadata(MsgType::Request, MethodType::Invite, false);
 
   EXPECT_CALL(callbacks_, route()).WillOnce(Return(route_ptr_));
   EXPECT_CALL(*route_, routeEntry()).WillOnce(Return(&route_entry_));

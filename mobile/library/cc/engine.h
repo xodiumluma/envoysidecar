@@ -17,10 +17,13 @@ using StreamClientSharedPtr = std::shared_ptr<StreamClient>;
 
 class Engine : public std::enable_shared_from_this<Engine> {
 public:
+  ~Engine();
+
+  std::string dumpStats();
   StreamClientSharedPtr streamClient();
   PulseClientSharedPtr pulseClient();
 
-  void terminate();
+  envoy_status_t terminate();
 
 private:
   Engine(envoy_engine_t engine);

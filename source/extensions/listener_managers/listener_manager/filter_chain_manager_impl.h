@@ -9,6 +9,7 @@
 #include "envoy/matcher/matcher.h"
 #include "envoy/network/drain_decision.h"
 #include "envoy/network/filter.h"
+#include "envoy/registry/registry.h"
 #include "envoy/server/filter_config.h"
 #include "envoy/server/instance.h"
 #include "envoy/server/options.h"
@@ -107,7 +108,7 @@ using FilterChainsByName = absl::flat_hash_map<std::string, Network::DrainableFi
 class FilterChainImpl : public Network::DrainableFilterChain {
 public:
   FilterChainImpl(Network::DownstreamTransportSocketFactoryPtr&& transport_socket_factory,
-                  std::vector<Network::FilterFactoryCb>&& filters_factory,
+                  Filter::NetworkFilterFactoriesList&& filters_factory,
                   std::chrono::milliseconds transport_socket_connect_timeout,
                   absl::string_view name)
       : transport_socket_factory_(std::move(transport_socket_factory)),
@@ -121,7 +122,7 @@ public:
   std::chrono::milliseconds transportSocketConnectTimeout() const override {
     return transport_socket_connect_timeout_;
   }
-  const std::vector<Network::FilterFactoryCb>& networkFilterFactories() const override {
+  const Filter::NetworkFilterFactoriesList& networkFilterFactories() const override {
     return filters_factory_;
   }
   void startDraining() override { factory_context_->startDraining(); }
@@ -137,7 +138,7 @@ public:
 private:
   Configuration::FilterChainFactoryContextPtr factory_context_;
   const Network::DownstreamTransportSocketFactoryPtr transport_socket_factory_;
-  const std::vector<Network::FilterFactoryCb> filters_factory_;
+  const Filter::NetworkFilterFactoriesList filters_factory_;
   const std::chrono::milliseconds transport_socket_connect_timeout_;
   const std::string name_;
 };
@@ -352,5 +353,10 @@ private:
   // Index filter chains by name, used by the matcher actions.
   FilterChainsByName filter_chains_by_name_;
 };
+
+namespace FilterChain {
+DECLARE_FACTORY(FilterChainNameActionFactory);
+}
+
 } // namespace Server
 } // namespace Envoy

@@ -39,8 +39,9 @@ public:
   void setup() {
     envoy::config::core::v3::ConfigSource lds_config;
     EXPECT_CALL(init_manager_, add(_));
-    lds_ = std::make_unique<LdsApiImpl>(lds_config, nullptr, cluster_manager_, init_manager_,
-                                        store_, listener_manager_, validation_visitor_);
+    lds_ =
+        std::make_unique<LdsApiImpl>(lds_config, nullptr, cluster_manager_, init_manager_,
+                                     *store_.rootScope(), listener_manager_, validation_visitor_);
     EXPECT_CALL(*cluster_manager_.subscription_factory_.subscription_, start(_));
     init_target_handle_->initialize(init_watcher_);
     lds_callbacks_ = cluster_manager_.subscription_factory_.callbacks_;
@@ -130,9 +131,8 @@ TEST_F(LdsApiTest, MisconfiguredListenerNameIsPresentInException) {
   EXPECT_CALL(init_watcher_, ready());
 
   const auto decoded_resources = TestUtility::decodeResources({listener});
-  EXPECT_THROW_WITH_MESSAGE(
-      lds_callbacks_->onConfigUpdate(decoded_resources.refvec_, ""), EnvoyException,
-      "Error adding/updating listener(s) invalid-listener: something is wrong\n");
+  EXPECT_EQ(lds_callbacks_->onConfigUpdate(decoded_resources.refvec_, "").message(),
+            "Error adding/updating listener(s) invalid-listener: something is wrong\n");
 }
 
 TEST_F(LdsApiTest, EmptyListenersUpdate) {
@@ -150,7 +150,7 @@ TEST_F(LdsApiTest, EmptyListenersUpdate) {
   ;
   EXPECT_CALL(init_watcher_, ready());
 
-  lds_callbacks_->onConfigUpdate({}, "");
+  EXPECT_TRUE(lds_callbacks_->onConfigUpdate({}, "").ok());
 }
 
 TEST_F(LdsApiTest, ListenerCreationContinuesEvenAfterException) {
@@ -181,10 +181,9 @@ TEST_F(LdsApiTest, ListenerCreationContinuesEvenAfterException) {
 
   const auto decoded_resources =
       TestUtility::decodeResources({listener_0, listener_1, listener_2, listener_3});
-  EXPECT_THROW_WITH_MESSAGE(lds_callbacks_->onConfigUpdate(decoded_resources.refvec_, ""),
-                            EnvoyException,
-                            "Error adding/updating listener(s) invalid-listener-1: something is "
-                            "wrong\ninvalid-listener-2: something else is wrong\n");
+  EXPECT_EQ(lds_callbacks_->onConfigUpdate(decoded_resources.refvec_, "").message(),
+            "Error adding/updating listener(s) invalid-listener-1: something is "
+            "wrong\ninvalid-listener-2: something else is wrong\n");
 }
 
 // Validate onConfigUpdate throws EnvoyException with duplicate listeners.
@@ -206,10 +205,9 @@ TEST_F(LdsApiTest, ValidateDuplicateListeners) {
   EXPECT_CALL(init_watcher_, ready());
 
   const auto decoded_resources = TestUtility::decodeResources({listener, listener});
-  EXPECT_THROW_WITH_MESSAGE(lds_callbacks_->onConfigUpdate(decoded_resources.refvec_, ""),
-                            EnvoyException,
-                            "Error adding/updating listener(s) duplicate_listener: duplicate "
-                            "listener duplicate_listener found\n");
+  EXPECT_EQ(lds_callbacks_->onConfigUpdate(decoded_resources.refvec_, "").message(),
+            "Error adding/updating listener(s) duplicate_listener: duplicate "
+            "listener duplicate_listener found\n");
 }
 
 TEST_F(LdsApiTest, Basic) {
@@ -246,7 +244,8 @@ TEST_F(LdsApiTest, Basic) {
   EXPECT_CALL(init_watcher_, ready());
   const auto decoded_resources =
       TestUtility::decodeResources<envoy::config::listener::v3::Listener>(response1);
-  lds_callbacks_->onConfigUpdate(decoded_resources.refvec_, response1.version_info());
+  EXPECT_TRUE(
+      lds_callbacks_->onConfigUpdate(decoded_resources.refvec_, response1.version_info()).ok());
 
   EXPECT_EQ("0", lds_->versionInfo());
 
@@ -279,7 +278,8 @@ TEST_F(LdsApiTest, Basic) {
   EXPECT_CALL(listener_manager_, endListenerUpdate(_));
   const auto decoded_resources_2 =
       TestUtility::decodeResources<envoy::config::listener::v3::Listener>(response2);
-  lds_callbacks_->onConfigUpdate(decoded_resources_2.refvec_, response2.version_info());
+  EXPECT_TRUE(
+      lds_callbacks_->onConfigUpdate(decoded_resources_2.refvec_, response2.version_info()).ok());
   EXPECT_EQ("1", lds_->versionInfo());
 }
 
@@ -312,7 +312,8 @@ TEST_F(LdsApiTest, UpdateVersionOnListenerRemove) {
   EXPECT_CALL(init_watcher_, ready());
   const auto decoded_resources =
       TestUtility::decodeResources<envoy::config::listener::v3::Listener>(response1);
-  lds_callbacks_->onConfigUpdate(decoded_resources.refvec_, response1.version_info());
+  EXPECT_TRUE(
+      lds_callbacks_->onConfigUpdate(decoded_resources.refvec_, response1.version_info()).ok());
 
   EXPECT_EQ("0", lds_->versionInfo());
 
@@ -330,7 +331,8 @@ TEST_F(LdsApiTest, UpdateVersionOnListenerRemove) {
   EXPECT_CALL(listener_manager_, endListenerUpdate(_));
   const auto decoded_resources_2 =
       TestUtility::decodeResources<envoy::config::listener::v3::Listener>(response2);
-  lds_callbacks_->onConfigUpdate(decoded_resources_2.refvec_, response2.version_info());
+  EXPECT_TRUE(
+      lds_callbacks_->onConfigUpdate(decoded_resources_2.refvec_, response2.version_info()).ok());
   EXPECT_EQ("1", lds_->versionInfo());
 }
 
@@ -362,9 +364,10 @@ resources:
   EXPECT_CALL(init_watcher_, ready());
   const auto decoded_resources =
       TestUtility::decodeResources<envoy::config::listener::v3::Listener>(response1);
-  lds_callbacks_->onConfigUpdate(decoded_resources.refvec_, response1.version_info());
+  EXPECT_TRUE(
+      lds_callbacks_->onConfigUpdate(decoded_resources.refvec_, response1.version_info()).ok());
 
-  std::string response2_basic = R"EOF(
+  constexpr absl::string_view response2_basic = R"EOF(
 version_info: '1'
 resources:
 - "@type": type.googleapis.com/envoy.config.listener.v3.Listener
@@ -401,8 +404,8 @@ resources:
   EXPECT_CALL(listener_manager_, endListenerUpdate(_));
   const auto decoded_resources_2 =
       TestUtility::decodeResources<envoy::config::listener::v3::Listener>(response2);
-  EXPECT_NO_THROW(
-      lds_callbacks_->onConfigUpdate(decoded_resources_2.refvec_, response2.version_info()));
+  EXPECT_NO_THROW(EXPECT_TRUE(
+      lds_callbacks_->onConfigUpdate(decoded_resources_2.refvec_, response2.version_info()).ok()));
 }
 
 // Validate behavior when the config fails delivery at the subscription level.
@@ -450,7 +453,8 @@ TEST_F(LdsApiTest, ReplacingListenerWithSameAddress) {
   EXPECT_CALL(init_watcher_, ready());
   const auto decoded_resources =
       TestUtility::decodeResources<envoy::config::listener::v3::Listener>(response1);
-  lds_callbacks_->onConfigUpdate(decoded_resources.refvec_, response1.version_info());
+  EXPECT_TRUE(
+      lds_callbacks_->onConfigUpdate(decoded_resources.refvec_, response1.version_info()).ok());
 
   EXPECT_EQ("0", lds_->versionInfo());
 
@@ -483,7 +487,8 @@ TEST_F(LdsApiTest, ReplacingListenerWithSameAddress) {
   EXPECT_CALL(listener_manager_, endListenerUpdate(_));
   const auto decoded_resources_2 =
       TestUtility::decodeResources<envoy::config::listener::v3::Listener>(response2);
-  lds_callbacks_->onConfigUpdate(decoded_resources_2.refvec_, response2.version_info());
+  EXPECT_TRUE(
+      lds_callbacks_->onConfigUpdate(decoded_resources_2.refvec_, response2.version_info()).ok());
 }
 
 } // namespace

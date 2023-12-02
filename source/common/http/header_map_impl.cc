@@ -18,6 +18,8 @@
 namespace Envoy {
 namespace Http {
 
+bool HeaderStringValidator::disable_validation_for_tests_ = false;
+
 namespace {
 
 constexpr absl::string_view DelimiterForInlineHeaders{","};
@@ -531,7 +533,7 @@ HeaderMapImplUtility::getAllHeaderMapImplInfo() {
 
 absl::string_view RequestHeaderMapImpl::protocol() const { return getProtocolValue(); }
 
-absl::string_view RequestHeaderMapImpl::authority() const { return getHostValue(); }
+absl::string_view RequestHeaderMapImpl::host() const { return getHostValue(); }
 
 absl::string_view RequestHeaderMapImpl::path() const { return getPathValue(); }
 
@@ -583,6 +585,11 @@ void RequestHeaderMapImpl::setByReference(absl::string_view key, absl::string_vi
   HeaderMapImpl::removeExisting(key);
 
   HeaderMapImpl::insertByKey(HeaderString(key), HeaderString(val));
+}
+
+void RequestHeaderMapImpl::removeByKey(absl::string_view key) {
+  ASSERT(validatedLowerCaseString(key));
+  HeaderMapImpl::removeExisting(key);
 }
 
 } // namespace Http
